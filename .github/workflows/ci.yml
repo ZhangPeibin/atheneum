@@ -16,7 +16,10 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          # The `api` extra is required here, not just in the test job: mypy
+          # strict cannot type modules that subclass pydantic BaseModel unless
+          # pydantic is importable, and reports every route decorator as untyped.
+          pip install -e ".[dev,net,api]"
       - name: Ruff
         run: ruff check src tests
       - name: Ruff format check
