@@ -385,22 +385,22 @@ def _coerce_value(key: str, value: Any, spec: dict[str, Any]) -> Any:
             return int(value)
         if isinstance(value, float) and value.is_integer():
             return int(value)
-        raise TypeError(f"argument {key!r} must be an integer, got {value!r}")
+        raise TypeError(f"argument {key!r} must be an integer, got {_describe(value)}")
 
     if expected == "number":
         if isinstance(value, bool) or not isinstance(value, int | float | str):
-            raise TypeError(f"argument {key!r} must be a number, got {value!r}")
+            raise TypeError(f"argument {key!r} must be a number, got {_describe(value)}")
         try:
             return float(value)
         except ValueError as exc:
-            raise TypeError(f"argument {key!r} must be a number, got {value!r}") from exc
+            raise TypeError(f"argument {key!r} must be a number, got {_describe(value)}") from exc
 
     if expected == "boolean":
         if isinstance(value, bool):
             return value
         if isinstance(value, str) and value.lower() in {"true", "false"}:
             return value.lower() == "true"
-        raise TypeError(f"argument {key!r} must be a boolean, got {value!r}")
+        raise TypeError(f"argument {key!r} must be a boolean, got {_describe(value)}")
 
     if expected == "string":
         if isinstance(value, str):
@@ -409,7 +409,7 @@ def _coerce_value(key: str, value: Any, spec: dict[str, Any]) -> Any:
         # intent is unambiguous, so render it instead of failing the call.
         if isinstance(value, int | float) and not isinstance(value, bool):
             return str(value)
-        raise TypeError(f"argument {key!r} must be a string, got {value!r}")
+        raise TypeError(f"argument {key!r} must be a string, got {_describe(value)}")
 
     if expected == "array":
         if isinstance(value, str):
@@ -425,8 +425,26 @@ def _coerce_value(key: str, value: Any, spec: dict[str, Any]) -> Any:
         return dict(value)
 
     if "enum" in spec and value not in spec["enum"]:
-        raise ValueError(f"argument {key!r} must be one of {spec['enum']}, got {value!r}")
+        raise ValueError(f"argument {key!r} must be one of {spec['enum']}, got {_describe(value)}")
     return value
+
+
+def _describe(value: Any, limit: int = 60) -> str:
+    """A short, safe description of a value for an error message.
+
+    Never ``repr()``: formatting a deeply nested list raises RecursionError while
+    building the message, which escaped the except handler and aborted the agent
+    run instead of becoming an error result. It also leaked object internals into
+    model-visible text.
+    """
+    name = type(value).__name__
+    try:
+        text = str(value)
+    except Exception:
+        return f"<{name}>"
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return f"{name}({text})"
 
 
 def _stringify(value: Any, *, limit: int) -> str:

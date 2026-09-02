@@ -120,6 +120,11 @@ def load_config(path: str | Path | None = None, *, env: Mapping[str, str] | None
         if env_key not in environment:
             continue
         raw = environment[env_key]
+        if not raw.strip():
+            # A blank value means "not set". Honouring it literally would put
+            # provider="" into the config, which reads as a configured-but-empty
+            # provider in `ath config` while actually falling back to offline.
+            continue
         data[name] = _convert(name, raw, spec.type)
 
     unknown_file_keys = set(data) - known

@@ -17,7 +17,14 @@ from atheneum.core.types import Document
 
 logger = logging.getLogger("atheneum.ingest")
 
-__all__ = ["MAX_FILE_BYTES", "discover_files", "looks_binary", "read_file", "read_text"]
+__all__ = [
+    "MAX_FILE_BYTES",
+    "SENSITIVE_NAMES",
+    "discover_files",
+    "looks_binary",
+    "read_file",
+    "read_text",
+]
 
 # A single chunking pass over a multi-hundred-megabyte file would dominate the
 # ingest and produce a chunk set nobody can read through.
@@ -31,11 +38,19 @@ TEXT_SUFFIXES = frozenset(
         ".go", ".rs", ".java", ".kt", ".scala", ".c", ".h", ".cc", ".cpp",
         ".hpp", ".cs", ".rb", ".php", ".sh", ".bash", ".zsh", ".fish", ".sql",
         ".html", ".htm", ".xml", ".css", ".scss", ".less", ".svg", ".vue",
-        ".svelte", ".csv", ".tsv", ".log", ".diff", ".patch", ".gitignore",
+        ".svelte", ".csv", ".tsv", ".log", ".diff", ".patch",
     }
 )
 
-DEFAULT_EXCLUDES = (".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache", ".pytest_cache", ".next", ".tox")
+# Filenames that are configuration or credentials rather than prose. `.env` in
+# particular holds API keys, and indexing it writes those keys into SQLite where
+# any later retrieval can surface them to a model.
+SENSITIVE_NAMES = frozenset({".env", ".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa", "credentials"})
+
+DEFAULT_EXCLUDES = (
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", "dist",
+    "build", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", ".tox",
+)
 
 
 def looks_binary(path: Path, sample_bytes: int = 8192) -> bool:
@@ -91,6 +106,18 @@ def read_text(path: Path, *, max_bytes: int = MAX_FILE_BYTES) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _is_regular_file(path: Path) -> bool:
+    """True only for a regular file.
+
+    `Path.is_file()` follows symlinks and returns True for a FIFO target too, so
+    it is not enough on its own: opening a FIFO for reading blocks forever.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def read_file(path: str | os.PathLike[str], *, title: str | None = None) -> Document:
     """Read one file into a Document addressed by its resolved path."""
     resolved = Path(path).expanduser().resolve()
@@ -98,6 +125,9 @@ def read_file(path: str | os.PathLike[str], *, title: str | None = None) -> Docu
         raise FileNotFoundError(f"no such file: {resolved}")
     if resolved.is_dir():
         raise IsADirectoryError(f"{resolved} is a directory; use discover_files() to walk it")
+    if not _is_regular_file(resolved):
+        # Without this a FIFO or a device node blocks the read indefinitely.
+        raise ValueError(f"{resolved} is not a regular file")
     if looks_binary(resolved):
         raise ValueError(f"{resolved} appears to be binary; text formats only")
 
@@ -171,14 +201,21 @@ def discover_files(
             visited.add(key)
 
         for name in sorted(filenames):
-            if name in excludes:
+            if name in excludes or name in SENSITIVE_NAMES or name.startswith(".env."):
+                logger.debug("skipping sensitive or excluded file %s", name)
                 continue
             candidate = Path(dirpath) / name
             if not _matches_any(name, patterns):
                 continue
             if candidate.suffix.lower() not in TEXT_SUFFIXES and candidate.suffix:
                 continue
-            if not candidate.is_file():
+            if not follow_symlinks and candidate.is_symlink():
+                # `is_file()` follows symlinks, so a link inside the tree pointing
+                # at /etc/passwd used to be read and indexed even with
+                # follow_symlinks=False -- the docstring promised otherwise.
+                logger.debug("skipping symlink %s", candidate)
+                continue
+            if not _is_regular_file(candidate):
                 continue
             yield candidate
             count += 1

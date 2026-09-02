@@ -12,6 +12,7 @@ import contextlib
 import json
 import logging
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,12 @@ def cli(ctx: click.Context, db: str | None, verbose: int) -> None:
     """
     level = logging.WARNING - min(verbose, 2) * 10
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
-    config = load_config()
+    try:
+        config = load_config()
+    except (ValueError, OSError) as exc:
+        # A bad ATHENEUM_TOP_K used to print a two-stage Python traceback. The
+        # message already names the variable and the offending value.
+        raise click.ClickException(str(exc)) from exc
     ctx.obj = {"config": config, "db": db or config.db, "verbose": verbose}
 
 
@@ -110,17 +116,19 @@ def index(
 
     if chunk_size is not None:
         config.chunk_size = chunk_size
-        if config.chunk_overlap >= chunk_size:
-            # Shrinking below the configured overlap is a normal thing to want, so
-            # adapt rather than fail with a validation error that looks like a bug.
-            config.chunk_overlap = max(0, chunk_size // 2)
-            if not as_json:
-                click.echo(
-                    f"note: chunk overlap reduced to {config.chunk_overlap} to fit chunk size {chunk_size}",
-                    err=True,
-                )
     if chunk_overlap is not None:
         config.chunk_overlap = chunk_overlap
+    if config.chunk_overlap >= config.chunk_size:
+        # Only one of the two is usually given, so clamping has to happen after
+        # both are applied. Doing it inside the chunk_size branch let an explicit
+        # --chunk-overlap override the clamp and surface a raw ValueError.
+        config.chunk_overlap = max(0, config.chunk_size // 2)
+        if not as_json:
+            click.echo(
+                f"note: chunk overlap reduced to {config.chunk_overlap} to fit "
+                f"chunk size {config.chunk_size}",
+                err=True,
+            )
 
     corpus = _open_corpus(ctx)
     try:
@@ -156,16 +164,15 @@ def rebuild_command(ctx: click.Context, chunk_size: int | None, chunk_overlap: i
     config: Config = _opts(ctx)["config"]
     if chunk_size is not None:
         config.chunk_size = chunk_size
-        if config.chunk_overlap >= chunk_size:
-            # Shrinking below the configured overlap is a normal thing to want, so
-            # adapt rather than fail with a validation error that looks like a bug.
-            config.chunk_overlap = max(0, chunk_size // 2)
-            click.echo(
-                f"note: chunk overlap reduced to {config.chunk_overlap} to fit chunk size {chunk_size}",
-                err=True,
-            )
     if chunk_overlap is not None:
         config.chunk_overlap = chunk_overlap
+    if config.chunk_overlap >= config.chunk_size:
+        config.chunk_overlap = max(0, config.chunk_size // 2)
+        click.echo(
+            f"note: chunk overlap reduced to {config.chunk_overlap} to fit "
+            f"chunk size {config.chunk_size}",
+            err=True,
+        )
     corpus = _open_corpus(ctx, create=False)
     try:
         stats = corpus.rebuild()
@@ -185,7 +192,11 @@ def rebuild_command(ctx: click.Context, chunk_size: int | None, chunk_overlap: i
 def search(ctx: click.Context, query: str, top: int | None, mode: str, explain: bool, as_json: bool) -> None:
     """Retrieve passages from the corpus without generating an answer."""
     config: Config = _opts(ctx)["config"]
-    limit = top or config.top_k
+    # `top or config.top_k` swallowed an explicit --top 0, because 0 is falsy,
+    # and let --top -5 through to a confusing "no matches".
+    if top is not None and top < 1:
+        raise click.BadParameter("--top must be at least 1", param_hint="--top")
+    limit = config.top_k if top is None else top
     corpus = _open_corpus(ctx, create=False)
     try:
         results = corpus.search(query, top_k=limit, mode=mode)  # type: ignore[arg-type]
@@ -547,9 +558,19 @@ def main() -> int:
     except click.Abort:
         click.echo("aborted", err=True)
         return 130
+    except click.BadParameter as exc:
+        exc.show()
+        return exc.exit_code
     except SystemExit as exc:
         return int(exc.code or 0)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, IsADirectoryError) as exc:
+        click.echo(f"error: {exc}", err=True)
+        return 2
+    except sqlite3.Error as exc:
+        # e.g. --db pointing at a directory: "unable to open database file".
+        click.echo(f"error: could not open the corpus database: {exc}", err=True)
+        return 2
+    except (ValueError, RuntimeError) as exc:
         click.echo(f"error: {exc}", err=True)
         return 2
     return 0

@@ -23,6 +23,9 @@ __all__ = ["CorpusStats", "Store", "StoredRow"]
 
 SCHEMA_VERSION = 1
 
+# Well under SQLite's default SQLITE_MAX_VARIABLE_NUMBER.
+_SQL_VARIABLE_LIMIT = 900
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -217,6 +220,24 @@ class Store:
     def get_meta(self, key: str) -> str | None:
         return self._get_meta(key)
 
+    # -- revision counters --------------------------------------------------
+    # Two counters rather than one, so an in-memory index can tell "rows were
+    # appended" (cheap incremental extend) from "rows were deleted" (the
+    # positional alignment is gone and a full reload is required). Collapsing
+    # them into one counter would force a full reload after every write, or --
+    # worse -- let a delete be mistaken for an append and silently misattribute
+    # search results to the wrong chunks.
+    def _bump(self, key: str) -> None:
+        self._set_meta(key, str(int(self._get_meta(key) or 0) + 1))
+
+    @property
+    def append_revision(self) -> int:
+        return int(self._get_meta("append_revision") or 0)
+
+    @property
+    def structure_revision(self) -> int:
+        return int(self._get_meta("structure_revision") or 0)
+
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction():
             self._set_meta(key, value)
@@ -224,26 +245,27 @@ class Store:
     # -- documents ----------------------------------------------------------
     def put_document(self, document: Document) -> bool:
         """Insert a document. Returns False if an identical one already exists."""
-        doc_id = document.id
-        exists = self._conn.execute(
-            "SELECT 1 FROM documents WHERE id = ?", (doc_id,)
-        ).fetchone()
-        if exists:
-            return False
         with self.transaction():
-            self._conn.execute(
-                "INSERT INTO documents(id, source, title, mime_type, content, metadata, added_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                (
-                    doc_id,
-                    document.source,
-                    document.title,
-                    document.mime_type,
-                    document.content,
-                    json.dumps(document.metadata, ensure_ascii=False, sort_keys=True),
-                    time.time(),
-                ),
-            )
+            return self._put_document_row(document)
+
+    def _put_document_row(self, document: Document) -> bool:
+        """Insert a document row. Assumes a transaction is already open."""
+        doc_id = document.id
+        if self._conn.execute("SELECT 1 FROM documents WHERE id = ?", (doc_id,)).fetchone():
+            return False
+        self._conn.execute(
+            "INSERT INTO documents(id, source, title, mime_type, content, metadata, added_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                doc_id,
+                document.source,
+                document.title,
+                document.mime_type,
+                document.content,
+                json.dumps(document.metadata, ensure_ascii=False, sort_keys=True),
+                time.time(),
+            ),
+        )
         return True
 
     def get_document(self, doc_id: str) -> Document | None:
@@ -289,6 +311,8 @@ class Store:
             )
             self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
             self._conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+            if count:
+                self._bump("structure_revision")
         return int(count)
 
     # -- chunks + vectors ---------------------------------------------------
@@ -313,39 +337,52 @@ class Store:
                 f"got {len(chunks)} chunks but {len(embeddings)} embeddings"
             )
 
-        positions: list[int] = []
         with self.transaction():
-            for index, (chunk, freqs) in enumerate(zip(chunks, term_frequencies, strict=True)):
-                duplicate = self._conn.execute(
-                    "SELECT pos FROM chunks WHERE id = ?", (chunk.id,)
-                ).fetchone()
-                if duplicate is not None:
-                    positions.append(int(duplicate["pos"]))
-                    continue
-                cur = self._conn.execute(
-                    "INSERT INTO chunks(id, doc_id, source, ordinal, text, metadata, tf) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        chunk.id,
-                        chunk.doc_id,
-                        chunk.source,
-                        chunk.ordinal,
-                        chunk.text,
-                        json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True),
-                        encode_term_frequencies(freqs),
-                    ),
+            return self._put_chunk_rows(chunks, term_frequencies, embeddings)
+
+    def _put_chunk_rows(
+        self,
+        chunks: Sequence[Chunk],
+        term_frequencies: Sequence[dict[str, int]],
+        embeddings: Sequence[Sequence[float]] | None = None,
+    ) -> list[int]:
+        """Insert chunk rows. Assumes a transaction is already open."""
+        positions: list[int] = []
+        inserted = False
+        for index, (chunk, freqs) in enumerate(zip(chunks, term_frequencies, strict=True)):
+            duplicate = self._conn.execute(
+                "SELECT pos FROM chunks WHERE id = ?", (chunk.id,)
+            ).fetchone()
+            if duplicate is not None:
+                positions.append(int(duplicate["pos"]))
+                continue
+            cur = self._conn.execute(
+                "INSERT INTO chunks(id, doc_id, source, ordinal, text, metadata, tf) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    chunk.id,
+                    chunk.doc_id,
+                    chunk.source,
+                    chunk.ordinal,
+                    chunk.text,
+                    json.dumps(chunk.metadata, ensure_ascii=False, sort_keys=True),
+                    encode_term_frequencies(freqs),
+                ),
+            )
+            pos = int(cur.lastrowid or 0)
+            positions.append(pos)
+            inserted = True
+            if embeddings is not None:
+                vector = embeddings[index]
+                array = _as_float32_bytes(vector)
+                self._conn.execute(
+                    "INSERT INTO vectors(pos, dim, embedding) VALUES(?, ?, ?) "
+                    "ON CONFLICT(pos) DO UPDATE SET dim = excluded.dim, "
+                    "embedding = excluded.embedding",
+                    (pos, len(vector), array),
                 )
-                pos = int(cur.lastrowid or 0)
-                positions.append(pos)
-                if embeddings is not None:
-                    vector = embeddings[index]
-                    array = _as_float32_bytes(vector)
-                    self._conn.execute(
-                        "INSERT INTO vectors(pos, dim, embedding) VALUES(?, ?, ?) "
-                        "ON CONFLICT(pos) DO UPDATE SET dim = excluded.dim, "
-                        "embedding = excluded.embedding",
-                        (pos, len(vector), array),
-                    )
+        if inserted:
+            self._bump("append_revision")
         return positions
 
     def chunk_count(self) -> int:
@@ -398,12 +435,20 @@ class Store:
     def get_chunks_by_id(self, chunk_ids: Sequence[str]) -> list[Chunk]:
         if not chunk_ids:
             return []
-        placeholders = ",".join("?" for _ in chunk_ids)
-        rows = self._conn.execute(
-            f"SELECT id, doc_id, source, ordinal, text, metadata FROM chunks "
-            f"WHERE id IN ({placeholders})",
-            tuple(chunk_ids),
-        ).fetchall()
+        # Batched: a single IN list above SQLite's bound-variable limit raises
+        # "too many SQL variables" rather than degrading gracefully.
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            for start in range(0, len(chunk_ids), _SQL_VARIABLE_LIMIT):
+                batch = list(chunk_ids[start : start + _SQL_VARIABLE_LIMIT])
+                placeholders = ",".join("?" for _ in batch)
+                rows.extend(
+                    self._conn.execute(
+                        "SELECT id, doc_id, source, ordinal, text, metadata FROM chunks "
+                        f"WHERE id IN ({placeholders})",
+                        tuple(batch),
+                    ).fetchall()
+                )
         by_id = {
             row["id"]: Chunk(
                 id=row["id"],
@@ -430,6 +475,7 @@ class Store:
             self._conn.execute("DELETE FROM chunks")
             if not keep_documents:
                 self._conn.execute("DELETE FROM documents")
+            self._bump("structure_revision")
 
     def get_document_ids(self) -> list[str]:
         rows = self._conn.execute("SELECT id FROM documents ORDER BY added_at").fetchall()

@@ -26,6 +26,7 @@ from atheneum.index.vectors import VectorIndex
 from atheneum.providers.base import Generation, GenerationRequest, Provider, ProviderError, Usage
 from atheneum.providers.offline import OfflineProvider, parse_evidence
 from atheneum.retrieval.fusion import RRFFusion
+from atheneum.retrieval.pipeline import Corpus
 from atheneum.text.splitter import SplitterConfig, split_text
 from atheneum.text.tokenizer import tokenize
 
@@ -382,3 +383,220 @@ def test_offline_provider_still_answers_after_the_guards():
     generation = provider.complete(request)
     assert "Reciprocal rank fusion" in generation.text
     assert "a.md" in generation.text
+
+
+# ---------------------------------------------------------------------------
+# Round 4 — index alignment (2 blockers) and filesystem security (2 highs)
+# ---------------------------------------------------------------------------
+
+import sqlite3  # noqa: E402
+
+from atheneum.core.types import Document  # noqa: E402
+from atheneum.ingest import discover_files, read_file  # noqa: E402
+
+
+def test_a_vectorless_chunk_does_not_desync_the_incremental_path(tmp_path):
+    """BLOCKER: the matrix fell one row behind _rows and misattributed results.
+
+    An incremental search returned v4.md where a fresh rebuild of the same
+    database returned v5.md, at an identical score of 1.0 — a silently wrong
+    citation, which is the worst failure mode a retrieval system has.
+    """
+    db = str(tmp_path / "align.db")
+    corpus = Corpus.open(db)
+    corpus.add_text("v1.md", "alpha alpha unique one")
+    corpus.add_text("v2.md", "beta beta unique two")
+    corpus.search("alpha", top_k=2)  # force a full load
+    corpus.add_text("v4.md", "gamma gamma unique four")  # incremental path
+
+    with sqlite3.connect(db) as conn:
+        pos = conn.execute("SELECT pos FROM chunks WHERE source LIKE '%v4%'").fetchone()[0]
+        conn.execute("DELETE FROM vectors WHERE pos = ?", (pos,))
+
+    corpus.add_text("v5.md", "delta delta unique five")
+    incremental = [h.chunk.source for h in corpus.search("delta unique five", top_k=3, mode="vector")]
+    corpus.close()
+
+    fresh = Corpus.open(db)
+    rebuilt = [h.chunk.source for h in fresh.search("delta unique five", top_k=3, mode="vector")]
+    fresh.close()
+
+    assert incremental == rebuilt
+    assert incremental[0] == "v5.md"
+
+
+def test_a_failed_rebuild_does_not_destroy_documents(tmp_path):
+    """BLOCKER: rebuild() cleared the documents table before re-embedding."""
+    db = str(tmp_path / "rebuild.db")
+    corpus = Corpus.open(db)
+    corpus.add_text("d1.md", "first document content here")
+    corpus.add_text("d2.md", "second document content here")
+    assert corpus.stats()["documents"] == 2
+
+    class Failing:
+        name = "failing"
+        dim = 512
+
+        def embed(self, text: str) -> np.ndarray:
+            raise RuntimeError("embedder offline")
+
+        def embed_many(self, texts) -> np.ndarray:
+            raise RuntimeError("embedder offline")
+
+    corpus.embedder = Failing()
+    with pytest.raises(RuntimeError):
+        corpus.rebuild()
+
+    stats = corpus.stats()
+    assert stats["documents"] == 2, "a failed rebuild must not lose source documents"
+    corpus.close()
+
+    reopened = Corpus.open(db)
+    assert reopened.stats()["documents"] == 2
+    reopened.close()
+
+
+def test_an_orphaned_document_can_be_reindexed(tmp_path):
+    """MAJOR: a failure between put_document and put_chunks wedged it forever."""
+    db = str(tmp_path / "orphan.db")
+    corpus = Corpus.open(db)
+
+    class FailsOnSecondBatch:
+        name = "flaky"
+        dim = 8
+        calls = 0
+
+        def embed(self, text: str) -> np.ndarray:
+            return np.zeros(8, dtype=np.float32)
+
+        def embed_many(self, texts) -> np.ndarray:
+            type(self).calls += 1
+            if type(self).calls >= 2:
+                raise RuntimeError("transient failure")
+            return np.zeros((len(texts), 8), dtype=np.float32)
+
+    corpus.embedder = FailsOnSecondBatch()
+    with pytest.raises(RuntimeError):
+        corpus.add_documents(
+            [Document(source="h1.md", content="one"), Document(source="h2.md", content="two")]
+        )
+
+    class Working:
+        name = "working"
+        dim = 8
+
+        def embed(self, text: str) -> np.ndarray:
+            return np.zeros(8, dtype=np.float32)
+
+        def embed_many(self, texts) -> np.ndarray:
+            return np.zeros((len(texts), 8), dtype=np.float32)
+
+    corpus.embedder = Working()
+    # h2 must not be permanently skipped as "already indexed".
+    assert corpus.add_text("h2.md", "two") >= 1
+    counts = {row["source"]: row["chunk_count"] for row in corpus.sources()}
+    assert counts["h2.md"] >= 1
+    corpus.close()
+
+
+def test_concurrent_writer_is_detected_by_revision_counters(tmp_path):
+    """MAJOR: a count-based skip could not see another instance's delete."""
+    db = str(tmp_path / "shared.db")
+    a = Corpus.open(db)
+    a.add_text("a1.md", "alpha one")
+    a.add_text("a2.md", "beta two")
+    a.add_text("a3.md", "gamma three")
+
+    b = Corpus.open(db)
+    b.search("alpha", top_k=3)  # b loads three rows
+
+    doc_id = next(row["id"] for row in a.sources() if row["source"] == "a2.md")
+    a.delete_document(doc_id)
+    a.add_text("a4.md", "delta four")
+
+    hits = [h.chunk.source for h in b.search("beta two", top_k=3)]
+    assert "a2.md" not in hits, "b served a chunk that another writer deleted"
+    assert any(h.chunk.source == "a4.md" for h in b.search("delta four", top_k=3))
+    a.close()
+    b.close()
+
+
+def test_limit_zero_indexes_nothing(tmp_path):
+    """MINOR: the limit was checked after the append, so 0 indexed one file."""
+    source = tmp_path / "tree"
+    source.mkdir()
+    (source / "x.md").write_text("some content here", encoding="utf-8")
+    corpus = Corpus.in_memory()
+    assert corpus.add_paths([source], limit=0) == 0
+    assert corpus.stats()["documents"] == 0
+    corpus.close()
+
+
+def test_symlinked_file_does_not_escape_the_indexed_tree(tmp_path):
+    """HIGH: `is_file()` follows symlinks, so follow_symlinks=False was a lie."""
+    outside = tmp_path / "secret.md"
+    outside.write_text("TOP-SECRET-OUTSIDE-CONTENT", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.md").write_text("legitimate content", encoding="utf-8")
+    (root / "link.md").symlink_to(outside)
+
+    found = {p.name for p in discover_files(root)}
+    assert found == {"real.md"}
+    assert not any("secret" in str(p) for p in discover_files(root))
+
+
+def test_fifo_and_device_nodes_are_refused_not_hung(tmp_path):
+    """MEDIUM: opening a FIFO for reading blocks forever."""
+    fifo = tmp_path / "pipe.md"
+    os.mkfifo(fifo)
+    assert list(discover_files(tmp_path)) == []
+    with pytest.raises(ValueError, match="not a regular file"):
+        read_file(fifo)
+
+
+def test_dot_env_is_never_indexed(tmp_path):
+    """MEDIUM: `.env` holds API keys and was in TEXT_SUFFIXES."""
+    (tmp_path / ".env").write_text("API_KEY=sk-indexed-secret", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("API_KEY=sk-other", encoding="utf-8")
+    (tmp_path / "notes.md").write_text("real prose content", encoding="utf-8")
+    found = {p.name for p in discover_files(tmp_path)}
+    assert found == {"notes.md"}
+
+
+def test_a_deeply_nested_argument_does_not_raise_recursion_error():
+    """HIGH: the coercion error message used repr(), which blew the stack.
+
+    The RecursionError happened while *building* the TypeError, inside the except
+    handler, so it escaped execute() and aborted the agent run.
+    """
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    def want_str(items: str) -> int:
+        """Wants a string."""
+        return len(items)
+
+    deep: object = [0]
+    for _ in range(6000):
+        deep = [deep]
+
+    result = ToolRegistry([tool(want_str)]).execute(
+        ToolCall(id="c", name="want_str", arguments={"items": deep})
+    )
+    assert result.is_error
+    assert "must be a string" in result.content
+
+
+def test_get_chunks_by_id_survives_a_huge_id_list(tmp_path):
+    """LOW: one IN list above SQLite's variable limit raised OperationalError."""
+    from atheneum.index.store import Store
+
+    store = Store(tmp_path / "many.db")
+    document = Document(source="x.md", content="hello world content")
+    store.put_document(document)
+    from atheneum.text.splitter import split_document
+
+    chunks = split_document(document)
+    store.put_chunks(chunks, [{} for _ in chunks])
+    assert len(store.get_chunks_by_id([chunks[0].id] * 40_000)) == 40_000
+    store.close()

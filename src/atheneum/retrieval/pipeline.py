@@ -127,7 +127,11 @@ class Corpus:
         # and must stay append-only and in positional order.
         self._rows: list[Chunk] = []
         self._loaded = False
-        self._pending = False
+        # Revision numbers as of the last load. Two counters, so an external
+        # writer that only appended can be folded in cheaply while one that
+        # deleted rows forces a full reload.
+        self._loaded_append = -1
+        self._loaded_structure = -1
         self._guard_embedder_mismatch()
 
     # -- construction -------------------------------------------------------
@@ -185,23 +189,29 @@ class Corpus:
                 batch = []
         if batch:
             total += self._index_batch(batch)
-        if total:
-            self._pending = True
         return total
 
     def _index_batch(self, documents: Sequence[Document]) -> int:
         added = 0
         for document in documents:
-            if not self.store.put_document(document):
-                logger.debug("document %s already indexed", document.source)
-                continue
             chunks = split_document(document, self.config.splitter)
-            if not chunks:
-                logger.warning("document %s produced no chunks", document.source)
-                continue
+            # Embedding happens outside the transaction: it can be slow and, for a
+            # networked embedder, can fail, and neither should hold a write lock.
+            embeddings = self._embed([c.text for c in chunks]) if chunks else []
             frequencies = [token_frequencies(tokenize(c.text)) for c in chunks]
-            embeddings = self._embed([c.text for c in chunks])
-            self.store.put_chunks(chunks, frequencies, embeddings)
+
+            # Document row and chunk rows commit together. Splitting them left an
+            # orphan document with zero chunks whenever embedding failed, and
+            # because put_document then reported "already present" on every retry,
+            # that document could never be indexed at all.
+            with self.store.transaction():
+                if not self.store._put_document_row(document):
+                    logger.debug("document %s already indexed", document.source)
+                    continue
+                if not chunks:
+                    logger.warning("document %s produced no chunks", document.source)
+                    continue
+                self.store._put_chunk_rows(chunks, frequencies, embeddings)
             added += len(chunks)
         return added
 
@@ -244,30 +254,42 @@ class Corpus:
         documents: list[Document] = []
         for root in paths:
             for found in discover_files(Path(root), patterns=patterns, exclude=exclude):
+                # Checked before reading, not after: `limit=0` used to index one
+                # whole file because the test happened once the append was done.
+                if limit is not None and len(documents) >= limit:
+                    break
                 try:
                     documents.append(read_file(found))
                 except Exception as exc:
                     logger.warning("skipping %s: %s", found, exc)
-                if limit is not None and len(documents) >= limit:
-                    break
             if limit is not None and len(documents) >= limit:
                 break
         return self.add_documents(documents) if documents else 0
 
     def delete_document(self, doc_id: str) -> int:
-        removed = self.store.delete_document(doc_id)
-        if removed:
-            self._loaded = False
-        return removed
+        # No local bookkeeping needed: the delete bumped structure_revision, and
+        # _ensure_ready reloads when it sees that change.
+        return self.store.delete_document(doc_id)
 
     # -- index maintenance --------------------------------------------------
     def _ensure_ready(self) -> None:
-        if self._loaded and not self._pending:
-            return
-        if self._loaded:
-            self._extend_rows()
-        else:
+        """Bring the in-memory indexes up to date with SQLite.
+
+        Freshness is decided by the store's revision counters rather than by a
+        flag this instance set itself, so a second Corpus writing to the same
+        file is detected. Counting rows was not enough: a concurrent delete could
+        leave the count unchanged while the contents differed, and the positional
+        alignment between the BM25 index, the vector matrix and `_rows` would
+        silently attribute results to the wrong chunks.
+        """
+        structure = self.store.structure_revision
+        append = self.store.append_revision
+        if not self._loaded or structure != self._loaded_structure:
             self._rebuild_rows()
+        elif append != self._loaded_append:
+            self._extend_rows()
+        self._loaded_append = append
+        self._loaded_structure = structure
 
     def _rebuild_rows(self) -> None:
         """Load the whole corpus from SQLite into both in-memory indexes."""
@@ -277,20 +299,28 @@ class Corpus:
 
         frequencies: list[dict[str, int]] = []
         blobs: list[bytes] = []
-        dim = int(getattr(self.embedder, "dim", 0)) or None
+        dim = int(getattr(self.embedder, "dim", 0)) or 0
+        missing = 0
         for row in self.store.iter_rows():
             frequencies.append(row.term_frequencies)
             blobs.append(row.embedding or b"")
             self._rows.append(row.chunk)
+            if not row.embedding:
+                missing += 1
 
         self._bm25.load(frequencies)
-        if blobs:
-            assert dim is not None
+        if blobs and dim:
             zero = [0.0] * dim
             vectors = [_blob_to_list(blob, dim) if blob else zero for blob in blobs]
             self._vectors.load(vectors, dim=dim)
+        if missing:
+            logger.warning(
+                "%d of %d chunks have no stored vector and were given a zero "
+                "vector; they are invisible to dense retrieval",
+                missing,
+                len(blobs),
+            )
         self._loaded = True
-        self._pending = False
 
     def _extend_rows(self) -> None:
         """Fold in chunks stored since the last load.
@@ -304,16 +334,28 @@ class Corpus:
             if index < already_loaded:
                 continue
             self._bm25.add_frequencies(row.term_frequencies)
-            if row.embedding and dim:
-                self._vectors.add(_blob_to_list(row.embedding, dim))
+            if dim:
+                if row.embedding:
+                    self._vectors.add(_blob_to_list(row.embedding, dim))
+                else:
+                    # A zero vector, not a skip. Skipping desynchronized the
+                    # matrix from _rows by one slot, so every later vector row
+                    # was attributed to the wrong chunk: an incremental search
+                    # returned v4.md where a fresh rebuild returned v5.md at the
+                    # identical score. The three structures must advance together.
+                    self._vectors.add([0.0] * dim)
+                    logger.warning(
+                        "chunk %s has no stored vector; it is invisible to dense retrieval",
+                        row.chunk.id,
+                    )
             self._rows.append(row.chunk)
         self._bm25.finalize()
-        self._pending = False
 
     def invalidate(self) -> None:
         """Force indexes to reload from SQLite on the next search."""
         self._loaded = False
-        self._pending = False
+        self._loaded_append = -1
+        self._loaded_structure = -1
 
     def configure(self, **overrides: Any) -> CorpusConfig:
         """Update retrieval parameters on a live corpus.
@@ -344,12 +386,24 @@ class Corpus:
             for doc_id in self.store.get_document_ids()
             if (doc := self.store.get_document(doc_id)) is not None
         ]
-        self.store.clear_index(keep_documents=False)
-        self._loaded = False
-        self._pending = False
+        # keep_documents=True: the documents are the raw material for the new
+        # chunks. Clearing them first meant that any failure part-way through
+        # re-embedding destroyed data permanently -- a two-document corpus came
+        # back with one document and zero chunks after a failed rebuild.
+        self.store.clear_index(keep_documents=True)
+        self.invalidate()
         self._rows = []
-        self.add_documents(documents)
-        self._rebuild_rows()
+        # Re-chunk the documents that are still stored. Going through
+        # add_documents would skip every one of them as "already indexed" and
+        # leave the corpus with documents but no chunks.
+        for document in documents:
+            chunks = split_document(document, self.config.splitter)
+            if not chunks:
+                continue
+            frequencies = [token_frequencies(tokenize(c.text)) for c in chunks]
+            embeddings = self._embed([c.text for c in chunks])
+            self.store.put_chunks(chunks, frequencies, embeddings)
+        self._ensure_ready()
         return self.stats()
 
     # -- search -------------------------------------------------------------
