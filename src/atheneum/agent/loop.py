@@ -192,7 +192,7 @@ class Agent:
             if not generation.tool_calls:
                 steps.append(Step(turn=turn, generation=generation))
                 return AgentRun(
-                    answer=generation.text or usage_and_partial(steps),
+                    answer=resolve_final_answer(generation, steps),
                     messages=tuple(memory.messages),
                     steps=tuple(steps),
                     usage=usage,
@@ -240,6 +240,10 @@ class Agent:
             )
             text_parts: list[str] = []
             calls: list[ToolCall] = []
+            # Per-turn usage, kept separate from the run-wide accumulator.
+            # Stamping the running total into each Step made summing the steps
+            # double-count: three turns of Usage(10, 5) summed to 90, not 45.
+            turn_usage = Usage()
             try:
                 for event in self.provider.stream(request):
                     if isinstance(event, TextDelta):
@@ -249,7 +253,7 @@ class Agent:
                         calls.append(event.call)
                         yield AgentEvent(kind="tool_call", turn=turn, tool_call=event.call)
                     else:
-                        usage = usage + event.usage
+                        turn_usage = turn_usage + event.usage
             except ProviderError as exc:
                 yield AgentEvent(
                     kind="done",
@@ -265,11 +269,12 @@ class Agent:
                 )
                 return
 
+            usage = usage + turn_usage
             generation = Generation(
                 text="".join(text_parts),
                 tool_calls=calls,
                 finish_reason="tool_calls" if calls else "stop",
-                usage=usage,
+                usage=turn_usage,
                 model=self.provider.name,
             )
             memory.add(Message.assistant(generation.text, generation.tool_calls))
@@ -280,11 +285,29 @@ class Agent:
                     kind="done",
                     turn=turn,
                     run=AgentRun(
-                        answer=generation.text,
+                        answer=resolve_final_answer(generation, steps),
                         messages=tuple(memory.messages),
                         steps=tuple(steps),
                         usage=usage,
                         stopped_reason="final_answer",
+                    ),
+                )
+                return
+
+            if not self.tools:
+                # run() reports this and stops; stream() used to keep looping
+                # until max_turns on an unknown_tool error every turn.
+                steps.append(Step(turn=turn, generation=generation))
+                yield AgentEvent(
+                    kind="done",
+                    turn=turn,
+                    run=AgentRun(
+                        answer=generation.text,
+                        messages=tuple(memory.messages),
+                        steps=tuple(steps),
+                        usage=usage,
+                        stopped_reason="no_tools",
+                        error="provider requested tools but none are registered",
                     ),
                 )
                 return
@@ -350,6 +373,15 @@ class Agent:
         except Exception as exc:
             logger.warning("approval callback raised %s; treating %s as declined", type(exc).__name__, call.name)
             return False
+
+
+def resolve_final_answer(generation: Generation, steps: Sequence[Step]) -> str:
+    """The answer to report when a turn produced no tool calls.
+
+    Shared by ``run`` and ``stream`` so the two views cannot drift: a provider
+    that ends a turn with empty text still deserves whatever it said earlier.
+    """
+    return generation.text or usage_and_partial(steps)
 
 
 def usage_and_partial(steps: Sequence[Step]) -> str:

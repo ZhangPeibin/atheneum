@@ -175,7 +175,12 @@ def render_transcript(messages: Sequence[Message]) -> str:
         body = message.content
         if message.tool_calls:
             body = (body + "\n" if body else "") + json.dumps(
-                {"tool_calls": [c.to_json() and {"id": c.id, "name": c.name, "arguments": c.arguments} for c in message.tool_calls]},
+                {
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments}
+                        for c in message.tool_calls
+                    ]
+                },
                 ensure_ascii=False,
                 sort_keys=True,
             )

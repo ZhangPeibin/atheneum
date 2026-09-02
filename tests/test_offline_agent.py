@@ -436,3 +436,163 @@ def test_run_tool_call_count_counts_every_turn():
     run = Agent(ScriptedProvider(calls), build_registry_with_noop()).run("q")
     assert run.tool_call_count == 2
     assert run.turns == 3
+
+
+# ---------------------------------------------------------------------------
+# Regressions from adversarial review. None of these were caught by the tests
+# above, which is the point: each one is a behaviour the suite previously
+# asserted nothing about.
+# ---------------------------------------------------------------------------
+class _UsageScripted(Provider):
+    """Emits a known usage per turn so accounting can be checked exactly."""
+
+    name = "usage-scripted"
+
+    def __init__(self, generations: list[Generation]) -> None:
+        self.generations = generations
+        self.calls = 0
+
+    def complete(self, request: GenerationRequest) -> Generation:
+        generation = self.generations[min(self.calls, len(self.generations) - 1)]
+        self.calls += 1
+        return generation
+
+
+def _three_turn_gens() -> list[Generation]:
+    return [
+        Generation(
+            text="",
+            tool_calls=[ToolCall(id=f"c{i}", name="noop", arguments={})],
+            finish_reason="tool_calls",
+            usage=Usage(10, 5),
+        )
+        for i in range(2)
+    ] + [Generation(text="done", finish_reason="stop", usage=Usage(10, 5))]
+
+
+@pytest.fixture
+def noop_registry():
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    def noop() -> str:
+        """Does nothing."""
+        return "ok"
+
+    return ToolRegistry([tool(noop)])
+
+
+def test_stream_and_run_report_identical_usage(noop_registry):
+    """stream() used to stamp the *cumulative* total into every Step.
+
+    Three turns of Usage(10, 5) summed to 90 across steps instead of 45, so any
+    consumer adding per-step usage double- and triple-counted.
+    """
+    run = Agent(_UsageScripted(_three_turn_gens()), noop_registry, config=AgentConfig(max_turns=5)).run("q")
+    streamed = list(
+        Agent(_UsageScripted(_three_turn_gens()), noop_registry, config=AgentConfig(max_turns=5)).stream("q")
+    )[-1].run
+
+    per_step_run = [s.generation.usage.total_tokens for s in run.steps]
+    per_step_stream = [s.generation.usage.total_tokens for s in streamed.steps]
+    assert per_step_run == per_step_stream == [15, 15, 15]
+    assert sum(per_step_stream) == streamed.usage.total_tokens == 45
+    assert run.usage == streamed.usage
+
+
+def test_stream_reports_no_tools_like_run_does():
+    """stream() used to loop to max_turns on an unregistered tool."""
+    gens = [
+        Generation(
+            text="",
+            tool_calls=[ToolCall(id="c", name="ghost", arguments={})],
+            finish_reason="tool_calls",
+        )
+    ]
+    from atheneum.agent.tools import ToolRegistry
+
+    run = Agent(_UsageScripted(gens), ToolRegistry(), config=AgentConfig(max_turns=8)).run("q")
+    streamed = list(
+        Agent(_UsageScripted(gens), ToolRegistry(), config=AgentConfig(max_turns=8)).stream("q")
+    )[-1].run
+
+    assert (run.stopped_reason, run.turns) == ("no_tools", 1)
+    assert (streamed.stopped_reason, streamed.turns) == ("no_tools", 1)
+
+
+def test_custom_base_exception_from_a_tool_becomes_data():
+    """A library raising a BaseException subclass used to abort the whole run."""
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    class Boom(BaseException):
+        pass
+
+    def explode() -> str:
+        """Raises a custom BaseException."""
+        raise Boom("kaboom")
+
+    result = ToolRegistry([tool(explode)]).execute(ToolCall(id="c", name="explode", arguments={}))
+    assert result.is_error
+    assert "Boom" in result.content
+
+
+def test_keyboard_interrupt_from_a_tool_still_propagates():
+    """Ctrl-C is a process signal, not a tool failure to recover from."""
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    def interrupt() -> str:
+        """Raises KeyboardInterrupt."""
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        ToolRegistry([tool(interrupt)]).execute(ToolCall(id="c", name="interrupt", arguments={}))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"results": [{"source": "a.md", "text": "A real passage.", "score": "high"}]},
+        {"results": [{"source": "a.md", "text": "A real passage.", "ordinal": "abc"}]},
+        {"results": [{"source": "a.md", "text": "A real passage.", "score": [1, 2]}]},
+    ],
+)
+def test_malformed_evidence_is_skipped_not_raised(payload):
+    """A third-party search tool emitting a non-numeric score killed the run.
+
+    The agent loop only catches ProviderError, so a bare ValueError escaped as a
+    traceback instead of degrading to "no evidence found".
+    """
+    message = Message.tool(ToolResult(call_id="c", name="search", content=json.dumps(payload)))
+    assert parse_evidence([message]) == []
+
+
+def test_well_formed_evidence_still_parses_after_the_guard():
+    message = Message.tool(
+        ToolResult(
+            call_id="c",
+            name="search",
+            content=json.dumps({"results": [{"source": "a.md", "ordinal": 2, "text": "Good passage.", "score": 0.75}]}),
+        )
+    )
+    evidence = parse_evidence([message])
+    assert len(evidence) == 1
+    assert evidence[0].score == 0.75
+    assert evidence[0].ordinal == 2
+
+
+def test_null_score_and_ordinal_default_rather_than_being_dropped():
+    """A null score is an absent value, not a malformed one.
+
+    Defaulting to 0.0 keeps the passage retrievable; discarding it would silently
+    throw away evidence just because a tool omitted an optional field.
+    """
+    message = Message.tool(
+        ToolResult(
+            call_id="c",
+            name="search",
+            content=json.dumps({"results": [{"source": "a.md", "text": "A real passage.", "score": None, "ordinal": None}]}),
+        )
+    )
+    evidence = parse_evidence([message])
+    assert len(evidence) == 1
+    assert evidence[0].score == 0.0
+    assert evidence[0].ordinal == 0

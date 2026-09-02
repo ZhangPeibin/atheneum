@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -25,6 +26,8 @@ from typing import Any
 from atheneum.core.types import Message, ToolCall
 from atheneum.providers.base import Generation, GenerationRequest, Provider, StreamEvent, Usage
 from atheneum.text.tokenizer import tokenize
+
+logger = logging.getLogger("atheneum.providers.offline")
 
 __all__ = ["Evidence", "OfflineProvider", "parse_evidence"]
 
@@ -203,13 +206,22 @@ def parse_evidence(messages: Sequence[Message]) -> list[Evidence]:
             text = entry.get("text") or entry.get("content")
             if not isinstance(text, str) or not text.strip():
                 continue
+            try:
+                ordinal = int(entry.get("ordinal", entry.get("chunk_ordinal", 0)) or 0)
+                score = float(entry.get("score", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                # A third-party search tool may emit "score": "high". Skipping
+                # the entry beats raising out of complete(), which the agent loop
+                # does not catch and would surface as a raw traceback.
+                logger.warning("skipping malformed evidence entry from %s", message.name)
+                continue
             collected.append(
                 Evidence(
                     source=str(entry.get("source", "unknown")),
-                    ordinal=int(entry.get("ordinal", entry.get("chunk_ordinal", 0)) or 0),
+                    ordinal=ordinal,
                     text=text.strip(),
                     rank=len(collected),
-                    score=float(entry.get("score", 0.0) or 0.0),
+                    score=score,
                     chunk_id=str(entry.get("chunk_id", "") or ""),
                 )
             )

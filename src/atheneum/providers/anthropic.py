@@ -81,27 +81,39 @@ class AnthropicProvider(Provider):
         url = f"{self.base_url}/messages"
         last: Exception | None = None
         for attempt in range(self.max_retries):
+            client = httpx.Client(timeout=self.timeout)
+            # See OpenAICompatibleProvider._request for why this flag exists:
+            # only a successfully built stream context transfers ownership.
+            handed_over = False
             try:
-                client = httpx.Client(timeout=self.timeout)
                 if stream:
-                    return client, client.stream("POST", url, headers=self._headers(), json=payload)
+                    context = client.stream("POST", url, headers=self._headers(), json=payload)
+                    handed_over = True
+                    return client, context
                 response = client.post(url, headers=self._headers(), json=payload)
                 if response.status_code in _RETRYABLE:
-                    last = ProviderError(f"anthropic returned {response.status_code}", status=response.status_code, retryable=True)
-                    _backoff(attempt, response.headers.get("retry-after"))
+                    last = ProviderError(
+                        f"anthropic returned {response.status_code}",
+                        status=response.status_code,
+                        retryable=True,
+                    )
+                    retry_after = response.headers.get("retry-after")
+                    _backoff(attempt, retry_after)
                     continue
                 if response.status_code >= 400:
                     raise ProviderError(
                         f"anthropic returned {response.status_code}: {response.text[:400]}",
                         status=response.status_code,
                     )
-                client.close()
                 return response.json()
             except ProviderError:
                 raise
             except httpx.HTTPError as exc:
                 last = exc
                 _backoff(attempt, None)
+            finally:
+                if not handed_over:
+                    client.close()
         raise ProviderError(f"anthropic request failed after {self.max_retries} attempts: {last}") from last
 
     def _payload(self, request: GenerationRequest, *, stream: bool) -> dict[str, Any]:

@@ -296,7 +296,14 @@ class ToolRegistry:
 
         try:
             produced = definition.function(**arguments)
-        except Exception as exc:
+        except (KeyboardInterrupt, SystemExit):
+            # Process-level signals, not tool failures. Swallowing a Ctrl-C so
+            # the model could "recover" from it would be hostile.
+            raise
+        except BaseException as exc:
+            # BaseException rather than Exception: a library raising a custom
+            # BaseException subclass used to abort the whole agent run, which
+            # contradicts this module's contract that tool errors are data.
             logger.warning("tool %s raised %s: %s", call.name, type(exc).__name__, exc)
             return ToolResult(
                 call_id=call.id,

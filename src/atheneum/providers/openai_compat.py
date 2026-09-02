@@ -90,19 +90,27 @@ class OpenAICompatibleProvider(Provider):
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
+            client = httpx.Client(timeout=self.timeout)
+            # Set only once the streaming context is successfully built, because
+            # from that point the caller owns the client and stream()'s finally
+            # closes it. Every other exit path -- retry, 4xx, missing API key,
+            # transport error -- must close here or the socket leaks.
+            handed_over = False
             try:
-                client = httpx.Client(timeout=self.timeout)
                 if stream:
-                    return client, client.stream(
+                    context = client.stream(
                         "POST", self._url(path), headers=self._headers(), json=payload
                     )
+                    handed_over = True
+                    return client, context
                 response = client.post(self._url(path), headers=self._headers(), json=payload)
                 status = response.status_code
                 if status in _RETRYABLE_STATUS:
                     last_error = ProviderError(
                         f"{self._url(path)} returned {status}", status=status, retryable=True
                     )
-                    _backoff(attempt, response.headers.get("retry-after"))
+                    retry_after = response.headers.get("retry-after")
+                    _backoff(attempt, retry_after)
                     continue
                 if status >= 400:
                     raise ProviderError(
@@ -110,13 +118,15 @@ class OpenAICompatibleProvider(Provider):
                         status=status,
                         retryable=False,
                     )
-                client.close()
                 return response.json()
             except ProviderError:
                 raise
             except httpx.HTTPError as exc:
                 last_error = exc
                 _backoff(attempt, None)
+            finally:
+                if not handed_over:
+                    client.close()
         raise ProviderError(
             f"request to {self._url(path)} failed after {self.max_retries} attempts: {last_error}",
             retryable=True,
