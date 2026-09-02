@@ -223,11 +223,18 @@ over the same queries on the same corpus. Current numbers on the bundled 18-docu
 (10 of them distractors or paraphrases, added specifically so the modes can disagree):
 
 ```
-MODE       recall@5   prec@5     MRR     hit  latency(ms)
-hybrid        0.923    0.200   0.837   0.923       0.160
-lexical       0.923    0.200   0.833   0.923       0.048
-vector        0.885    0.192   0.766   0.885       0.053
+MODE       recall@5   prec@5     MRR     hit
+hybrid        0.923    0.200   0.837   0.923
+lexical       0.923    0.200   0.833   0.923
+vector        0.885    0.192   0.766   0.885
 ```
+
+The first four columns are deterministic and reproduce exactly on any machine.
+`ath eval` also prints a latency column, but that one is machine- and
+run-dependent — the same hybrid evaluation measured between 0.16 ms and 0.27 ms
+across runs here — so it is reported live rather than quoted as a fixed figure.
+For throughput on your own hardware use `ath bench PATH...`; on this machine it
+ingested 322 chunks at ~1170 chunks/s with a mean query time of 0.12 ms.
 
 Read that honestly: with the default hashed embedder, hybrid wins by a **small** margin on MRR and
 ties on recall. The margin is real but it is not dramatic, and it would vanish entirely on a corpus
