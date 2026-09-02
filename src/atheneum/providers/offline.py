@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -209,6 +210,12 @@ def parse_evidence(messages: Sequence[Message]) -> list[Evidence]:
             try:
                 ordinal = int(entry.get("ordinal", entry.get("chunk_ordinal", 0)) or 0)
                 score = float(entry.get("score", 0.0) or 0.0)
+                if not math.isfinite(score):
+                    # float() happily accepts "1e999", "nan" and "Infinity". Both
+                    # sort ahead of every real score, which pushes genuine
+                    # evidence out of the window and prints "score inf" in a
+                    # citation, so they are rejected like any other bad value.
+                    raise ValueError(f"non-finite score {score!r}")
             except (TypeError, ValueError):
                 # A third-party search tool may emit "score": "high". Skipping
                 # the entry beats raising out of complete(), which the agent loop

@@ -11,6 +11,7 @@ whole run because one call had a bad argument is how agent loops become useless.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -296,9 +297,10 @@ class ToolRegistry:
 
         try:
             produced = definition.function(**arguments)
-        except (KeyboardInterrupt, SystemExit):
-            # Process-level signals, not tool failures. Swallowing a Ctrl-C so
-            # the model could "recover" from it would be hostile.
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError, GeneratorExit):
+            # Process- and task-level signals, not tool failures. Swallowing a
+            # Ctrl-C so the model could "recover" from it would be hostile, and
+            # turning CancelledError into data defeats cancellation entirely.
             raise
         except BaseException as exc:
             # BaseException rather than Exception: a library raising a custom
@@ -319,12 +321,25 @@ class ToolRegistry:
                 is_error=True,
             )
 
-        return ToolResult(
-            call_id=call.id,
-            name=call.name,
-            content=_stringify(produced, limit=result_limit),
-            is_error=False,
-        )
+        try:
+            content = _stringify(produced, limit=result_limit)
+        except Exception as exc:
+            # Serialisation happens outside the call above, so a tool returning an
+            # object whose __repr__ raises would abort the run despite the
+            # contract that tool failures are data.
+            logger.warning("tool %s result could not be serialised: %s", call.name, exc)
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                content=json.dumps(
+                    {
+                        "error": type(exc).__name__,
+                        "message": f"tool succeeded but its result could not be serialised: {exc}",
+                    }
+                ),
+                is_error=True,
+            )
+        return ToolResult(call_id=call.id, name=call.name, content=content, is_error=False)
 
 
 def _coerce(raw: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:

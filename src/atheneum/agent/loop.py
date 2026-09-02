@@ -253,16 +253,25 @@ class Agent:
                         calls.append(event.call)
                         yield AgentEvent(kind="tool_call", turn=turn, tool_call=event.call)
                     else:
-                        turn_usage = turn_usage + event.usage
+                        # Replace rather than accumulate: openai_compat computes a
+                        # single cumulative usage for the turn and emits it once,
+                        # so summing every event would double-count if a provider
+                        # ever emitted more than one.
+                        turn_usage = event.usage
             except ProviderError as exc:
                 yield AgentEvent(
                     kind="done",
                     turn=turn,
                     run=AgentRun(
-                        answer="".join(text_parts),
+                        # run() falls back to earlier turns here; streaming used to
+                        # return only the failing turn's partial text, so the two
+                        # views disagreed on the same failure.
+                        answer="".join(text_parts) or usage_and_partial(steps),
                         messages=tuple(memory.messages),
                         steps=tuple(steps),
-                        usage=usage,
+                        # Usage the provider reported before failing is still real
+                        # spend and must not be dropped with the exception.
+                        usage=usage + turn_usage,
                         stopped_reason="provider_error",
                         error=str(exc),
                     ),

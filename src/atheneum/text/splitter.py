@@ -43,6 +43,9 @@ class SplitterConfig:
     # which makes retrieval on source code actively worse. Default to respecting
     # fence boundaries.
     respect_code_fences: bool = True
+    # Pieces shorter than this are merged into a neighbouring chunk when they
+    # fit. They are never discarded: dropping text from an index is a silent
+    # correctness failure, whereas a small chunk is only a mild quality cost.
     min_chunk_chars: int = 24
 
     def __post_init__(self) -> None:
@@ -66,7 +69,34 @@ def split_text(text: str, config: SplitterConfig | None = None) -> list[str]:
     pieces: list[str] = []
     for section in _split_sections(text, cfg):
         pieces.extend(_pack(section, cfg))
-    return [p for p in pieces if len(p.strip()) >= cfg.min_chunk_chars] or pieces[:1]
+    return _absorb_short_pieces(pieces, cfg)
+
+
+def _absorb_short_pieces(pieces: Sequence[str], cfg: SplitterConfig) -> list[str]:
+    """Fold undersized pieces into a neighbour instead of discarding them.
+
+    This used to be a filter — ``[p for p in pieces if len(p.strip()) >=
+    min_chunk_chars] or pieces[:1]`` — which silently threw content away. With
+    chunk_size=20 and overlap=19 a 240-character input produced 240 short pieces,
+    every one was filtered out, and the ``or pieces[:1]`` fallback kept a single
+    20-character chunk: 73% of the text vanished from the index without a warning.
+    A retrieval system that loses text is worse than one with a few small chunks,
+    so short pieces are merged when they fit and kept as-is when they do not.
+    """
+    merged: list[str] = []
+    for piece in pieces:
+        stripped = piece.strip()
+        if not stripped:
+            continue
+        if (
+            len(stripped) < cfg.min_chunk_chars
+            and merged
+            and len(merged[-1]) + len(stripped) + 1 <= cfg.chunk_size
+        ):
+            merged[-1] = f"{merged[-1].rstrip()}\n{stripped}"
+        else:
+            merged.append(piece)
+    return merged
 
 
 def split_document(
@@ -219,5 +249,8 @@ def _split_sentences(text: str) -> list[str]:
     if len(parts) <= 1:
         # No sentence punctuation at all (common in code or CJK prose written
         # without terminators): fall back to newline and clause boundaries.
-        parts = [p for p in re.split(r"[\n，,、；;]", text) if p and p.strip()]
+        # Lookbehind split, so the separator stays attached to the clause it
+        # ends. A plain character-class split consumed every CJK comma, which
+        # removed 12 punctuation marks from a 3-chunk CJK document.
+        parts = [p for p in re.split(r"(?<=[\n，,、；;])", text) if p and p.strip()]
     return parts or [text]

@@ -11,6 +11,8 @@ from collections.abc import Iterable, Sequence
 
 import numpy as np
 
+from atheneum.index.selection import top_k_indices
+
 __all__ = ["VectorIndex"]
 
 _INITIAL_CAPACITY = 256
@@ -40,12 +42,20 @@ class VectorIndex:
 
     @property
     def matrix(self) -> np.ndarray:
-        """The normalized vectors as a read-only (count, dim) view."""
+        """The normalized vectors as a (count, dim) array.
+
+        A copy, not a view. ``setflags(write=False)`` on the slice only made the
+        slice itself immutable: ``matrix.base`` was still the writable internal
+        capacity buffer, so a caller could mutate stored vectors and read rows
+        beyond ``count`` (shape (256, dim) for a 3-vector index). This accessor
+        is for inspection and tests, never on the query path, so the copy is free
+        where it matters.
+        """
         if self._matrix is None:
             return np.empty((0, 0), dtype=np.float32)
-        view = self._matrix[: self._count]
-        view.setflags(write=False)
-        return view
+        out = self._matrix[: self._count].copy()
+        out.setflags(write=False)
+        return out
 
     @staticmethod
     def normalize(vector: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -170,10 +180,4 @@ class VectorIndex:
 
 
 def _top_k(scores: np.ndarray, top_k: int) -> list[tuple[int, float]]:
-    if scores.size <= top_k:
-        ordered = np.argsort(-scores, kind="stable")
-    else:
-        candidates = np.argpartition(-scores, top_k - 1)[:top_k]
-        ordered = candidates[np.argsort(-scores[candidates], kind="stable")]
-    ordered = ordered[scores[ordered] > 0]
-    return [(int(i), float(scores[i])) for i in ordered]
+    return [(int(i), float(scores[i])) for i in top_k_indices(scores, top_k)]

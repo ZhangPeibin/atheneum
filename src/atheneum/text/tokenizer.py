@@ -18,10 +18,14 @@ __all__ = ["CJK_STOPWORDS", "ENGLISH_STOPWORDS", "token_frequencies", "tokenize"
 # Han, Hiragana, Katakana, Hangul. These scripts are written without spaces
 # between words, so character-level n-grams are used instead of word splitting.
 _CJK_RANGES = (
+    (0x1100, 0x11FF),  # Hangul Jamo (leading/consonant vowels)
     (0x3040, 0x30FF),  # Hiragana + Katakana
+    (0x3130, 0x318F),  # Hangul Compatibility Jamo
     (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
     (0x4E00, 0x9FFF),  # CJK Unified Ideographs
     (0xAC00, 0xD7AF),  # Hangul Syllables
+    (0xA960, 0xA97F),  # Hangul Jamo Extended-A
+    (0xD7B0, 0xD7FF),  # Hangul Jamo Extended-B
     (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
     (0x20000, 0x2A6DF),  # CJK Extension B
 )
@@ -52,7 +56,14 @@ def _normalize(text: str) -> str:
     """
     folded = unicodedata.normalize("NFKC", text).casefold()
     decomposed = unicodedata.normalize("NFD", folded)
-    stripped = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    # Mn = combining marks (accent folding). Cf = format characters such as ZWJ
+    # and ZWNJ; left in place they interrupt a CJK run and suppress the bigram,
+    # so "中\u200d文" indexed as two unrelated characters instead of one phrase.
+    stripped = "".join(
+        char
+        for char in decomposed
+        if unicodedata.category(char) not in {"Mn", "Cf"}
+    )
     return unicodedata.normalize("NFC", stripped)
 
 

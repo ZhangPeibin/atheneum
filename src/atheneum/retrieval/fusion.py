@@ -96,24 +96,44 @@ class RRFFusion:
         totals: dict[str, float] = defaultdict(float)
         contributions: dict[str, dict[str, float]] = defaultdict(dict)
         values: dict[str, T] = {}
+        # Which list supplied the surviving payload for a key, as
+        # (weight, name) so precedence is deterministic and independent of the
+        # order the caller happened to build the dict in.
+        provenance: dict[str, tuple[float, str]] = {}
 
         for list_name, weight in zip(names, resolved, strict=True):
+            seen_in_list: set[str] = set()
             for rank, (key, value) in enumerate(ranked_lists[list_name]):
-                totals[key] += weight / (self.k + rank)
-                contributions[key][list_name] = weight / (self.k + rank)
-                values.setdefault(key, value)
+                if key in seen_in_list:
+                    # A ranked list must not contain the same key twice. Counting
+                    # it again inflated the score past the documented maximum of
+                    # 1.0 while contributions kept only one entry, so the parts no
+                    # longer summed to the whole.
+                    continue
+                seen_in_list.add(key)
+                share = weight / (self.k + rank)
+                totals[key] += share
+                contributions[key][list_name] = share
+                candidate = (weight, list_name)
+                if key not in provenance or candidate > provenance[key]:
+                    provenance[key] = candidate
+                    values[key] = value
 
         # Weights sum to 1, so an item ranked first in every list scores exactly
         # 1/k before this scaling. Multiplying by k therefore makes 1.0 mean
         # "top of every retriever" and anything less a proportion of that, which
         # is far more legible than raw 1/(k+rank) magnitudes around 0.016.
+        #
+        # Contributions are scaled by the same factor so that they sum to the
+        # reported score. Leaving them raw made `--explain` output incoherent:
+        # the parts summed to score/k, not to the score.
         ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
         return [
             RankedItem(
                 key=key,
                 value=values[key],
                 score=total * self.k,
-                contributions=dict(contributions[key]),
+                contributions={name: share * self.k for name, share in contributions[key].items()},
             )
             for key, total in ordered
         ]

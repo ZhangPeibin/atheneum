@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from atheneum.index.selection import top_k_indices
 from atheneum.text.tokenizer import token_frequencies, tokenize
 
 __all__ = ["BM25Index", "BM25Params"]
@@ -206,7 +207,12 @@ class BM25Index:
         doc_lengths = np.asarray(self._doc_lengths, dtype=np.float64)
         avgdl = self._avgdl or 1.0
         k1, b = self.params.k1, self.params.b
-        for term in set(tokenize(query)):
+        # dict.fromkeys, not set(): set iteration order depends on
+        # PYTHONHASHSEED, and because floating-point addition is not associative
+        # the accumulated score changed in its last bits between processes. That
+        # broke the reproducibility guarantee and let score_all() disagree with
+        # search() by an ulp on the same query.
+        for term in dict.fromkeys(tokenize(query)):
             posting = self._postings.get(term)
             if posting is None:
                 continue
@@ -224,23 +230,5 @@ class BM25Index:
 
 
 def _top_k(scores: np.ndarray, top_k: int) -> list[tuple[int, float]]:
-    """Indices of the k highest scores, descending.
-
-    ``argpartition`` pre-selects in O(n) rather than sorting everything, and ties
-    resolve to the lower chunk index so results are reproducible run to run.
-    """
-    if top_k <= 0 or scores.size == 0:
-        return []
-
-    candidates = np.flatnonzero(scores > 0)
-    if candidates.size == 0:
-        return []
-    if candidates.size > top_k:
-        candidates = np.argpartition(-scores, top_k - 1)[:top_k]
-        candidates = candidates[scores[candidates] > 0]
-
-    # Sorting ascending first makes the stable argsort below break score ties by
-    # chunk index, which is what makes the output deterministic.
-    candidates.sort()
-    ordered = candidates[np.argsort(-scores[candidates], kind="stable")]
-    return [(int(i), float(scores[i])) for i in ordered]
+    """Highest-scoring chunks, ties broken by lowest index. See index/selection."""
+    return [(int(i), float(scores[i])) for i in top_k_indices(scores, top_k)]
