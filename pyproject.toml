@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atheneum"
+version = "0.1.0"
+description = "Local-first AI research engine: hybrid BM25 + vector retrieval with RRF fusion, an agentic tool loop, and cited answers. Zero external services."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Zhang Peibin" }]
+keywords = ["rag", "retrieval", "bm25", "hybrid-search", "agents", "llm", "sqlite", "local-first"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+]
+dependencies = [
+    "click>=8.1",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+net = ["httpx>=0.27"]
+api = ["fastapi>=0.111", "uvicorn>=0.30"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+ath = "atheneum.cli:main"
+atheneum = "atheneum.cli:main"
+
+[project.entry-points."atheneum.providers"]
+offline = "atheneum.providers.offline:OfflineProvider"
+extractive = "atheneum.providers.offline:OfflineProvider"
+
+[project.urls]
+Homepage = "https://github.com/ZhangPeibin/atheneum"
+Issues = "https://github.com/ZhangPeibin/atheneum/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atheneum"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/atheneum", "tests", "examples", "docs", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+# RUF001/002/003 flag fullwidth CJK punctuation as "ambiguous unicode". Here it
+# is deliberate: sentence boundaries and tokenization must handle 。！？；， so
+# these characters are load-bearing, not typos.
+ignore = ["E501", "B008", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+packages = ["atheneum"]
+strict = true
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["numpy.*", "httpx.*", "fastapi.*", "uvicorn.*", "click.*"]
+ignore_missing_imports = true
