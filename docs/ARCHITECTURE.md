@@ -308,6 +308,7 @@ the default bind is loopback.
 | Multi-agent orchestration | No evidence it improves single-question grounded answering |
 | Vector database integration | See "Dense vectors without a vector database" |
 | MCP client | `simonw/llm`'s *"ability to use MCP servers"* is a 17-comment request; it is a clean extension point (`ToolRegistry`) but not v0.1 |
+| Stemming / lemmatization | Reduces `bursts`→`burst`, but merges unrelated words and degrades precision silently. **Cost is real and measured**: `tokenize("burst size allowed")` shares zero terms with `tokenize("allowing bursts to 200 requests")`, so morphological variants are carried only by the dense retriever. Documented as a limitation rather than hidden |
 
 ## 4. Licence analysis
 

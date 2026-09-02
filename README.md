@@ -264,6 +264,12 @@ Be clear-eyed before you adopt this:
   0.802 here against 0.833 for lexical alone — fusing in a weak second opinion made ranking *worse*.
   The shipped default of `bm25=0.7, vector=0.3` scores 0.837. If you swap in a strong neural
   embedder, raise the vector weight; the default is tuned for the embedder that ships with it.
+- **No stemming or lemmatization.** `ath search "burst limit"` will not lexically match a document
+  saying "bursts", because the tokenizer folds case and accents but does not reduce words to a root.
+  Verified: `tokenize("burst size allowed")` and `tokenize("allowing bursts to 200 requests")` share
+  **zero** terms, so such a query is carried entirely by the dense retriever. This is a deliberate
+  trade — a stemmer is fast and occasionally merges unrelated words, which degrades precision
+  silently — but it is a real gap for morphologically rich queries.
 - **Vector search is exact brute force.** Fine to a few hundred thousand chunks; beyond that, or at
   high dimension, bring an ANN index.
 - **Single-writer SQLite.** Concurrent readers are fine (WAL); concurrent ingesters are not.
