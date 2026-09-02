@@ -312,8 +312,26 @@ the default bind is loopback.
 
 ## 4. Licence analysis
 
-Of the 34 repositories studied: 15 Apache-2.0, 12 MIT, 3 BSD-3-Clause,
-2 AGPL-3.0 (khoj, cherry-studio), 1 GPL-3.0 (chatbox), 2 NOASSERTION/custom.
+34 repositories were cloned and analysed; 33 yielded source data (`letta-ai/letta`'s
+`main` branch is documentation-only at the time of writing, so nothing was
+measurable). Licence distribution across those 33, after correcting one
+detector miss — `sigoden/aichat` stores its licence in `LICENSE-APACHE`, which a
+filename-based scan skips, and was confirmed Apache-2.0 via the GitHub licence
+API:
+
+| Licence | Count | Examples |
+| --- | --- | --- |
+| MIT | 14 | pydantic-ai, llama_index, langgraph, langchain, OpenHands, anything-llm, Perplexica, R2R, gptme, graphrag, onyx, NextChat |
+| Apache-2.0 | 13 | ragflow, haystack, dify, smolagents, simonw/llm, private-gpt, cognita, gpt-researcher, lobehub, Flowise, rank_bm25, aichat |
+| AGPL-3.0 | 2 | khoj, cherry-studio |
+| BSD-3-Clause | 2 | open-webui, Verba |
+| GPL-3.0 | 1 | chatbox |
+| custom (fair-code) | 1 | n8n (Sustainable Use License, not OSI-approved) |
+
+The earlier draft of this document stated 15 Apache-2.0 / 12 MIT / 3 BSD-3 /
+2 NOASSERTION. Those numbers were wrong — they were recalled rather than
+recounted from the collected reports. The table above is generated from the
+34 stored analysis reports.
 
 **Atheneum is Apache-2.0.** No code was copied from any repository. What was taken
 is:
