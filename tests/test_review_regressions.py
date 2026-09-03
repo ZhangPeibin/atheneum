@@ -1616,3 +1616,81 @@ def test_approval_is_decided_before_arguments_are_processed():
     assert json.loads(registry.execute(bad, approver=lambda _c, _d: True).content)["error"] == "invalid_arguments"
     good = ToolCall(id="c", name="destruct", arguments={})
     assert registry.execute(good, approver=lambda _c, _d: True).content == "ran"
+
+
+# ---------------------------------------------------------------------------
+# Round 11 — credential exclusion and serialisation cost
+# ---------------------------------------------------------------------------
+
+from atheneum.ingest import is_sensitive_name  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env", ".ENV", "Env", "env", ".env2", ".env.local", ".env.production",
+        "config.env", "app.env.sample", ".env.production.local", "secrets.yaml", "secret.json",
+        "id_ed25519", "id_rsa", "id_ecdsa", "credentials", "credentials.json",
+        ".npmrc", ".netrc", ".pgpass", "server.pem", "tls.key", "bundle.p12",
+        "signing.asc", "vault.kdbx", "private_key.txt", "keystore.jks", "token",
+    ],
+)
+def test_credential_shaped_filenames_are_not_indexed(tmp_path, name: str):
+    """Exact-name matching let .env2, config.env, id_ed25519 and secrets.yaml through.
+
+    Indexed credentials land in SQLite and become retrievable, so a model can
+    quote a private key back in an answer.
+    """
+    assert is_sensitive_name(name), name
+    (tmp_path / name).write_text("SECRET=1", encoding="utf-8")
+    (tmp_path / "keep.md").write_text("legitimate prose", encoding="utf-8")
+    assert {p.name for p in discover_files(tmp_path)} == {"keep.md"}
+
+
+@pytest.mark.parametrize(
+    "name", ["notes.md", "README.md", "deploy.yml", "environment.md", "environ.py", "envoy.yaml", "main.go"]
+)
+def test_ordinary_filenames_are_not_over_blocked(tmp_path, name: str):
+    """The other failure mode: excluding everything that merely contains 'env'."""
+    assert not is_sensitive_name(name), name
+    (tmp_path / name).write_text("legitimate content here", encoding="utf-8")
+    assert {p.name for p in discover_files(tmp_path)} == {name}
+
+
+def test_symlinked_files_do_not_escape_even_when_directories_are_pruned(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("TOP-SECRET", encoding="utf-8")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.md").write_text("legit", encoding="utf-8")
+    (root / "link.md").symlink_to(outside / "secret.md")
+    (root / "dirlink").symlink_to(outside)
+    assert {p.name for p in discover_files(root)} == {"real.md"}
+    # Opting in is explicit and does follow, which is the documented behaviour.
+    followed = {p.name for p in discover_files(root, follow_symlinks=True)}
+    assert "link.md" in followed
+
+
+def test_bounding_a_collection_caps_work_not_just_output():
+    """2000 elements of 200 KB each serialized in full before truncation."""
+    def nested() -> object:
+        """Returns nested collections."""
+        return [{"k": "v" * 200_000} for _ in range(2000)]
+
+    started = time.perf_counter()
+    result = ToolRegistry([tool(nested)]).execute(ToolCall(id="c", name="nested", arguments={}))
+    elapsed = time.perf_counter() - started
+    assert not result.is_error
+    assert len(result.content) < 30_000
+    assert "long values truncated" in result.content
+    assert elapsed < 0.5, f"serialisation still costs {elapsed:.2f}s"
+
+
+def test_the_truncation_note_is_not_repeated_per_element():
+    def many() -> list:
+        """Returns many long strings."""
+        return ["x" * 50_000 for _ in range(50)]
+
+    content = ToolRegistry([tool(many)]).execute(ToolCall(id="c", name="many", arguments={})).content
+    assert content.count("long values truncated") == 1

@@ -22,6 +22,7 @@ from atheneum.core.types import ToolCall, ToolResult
 logger = logging.getLogger("atheneum.tools")
 __all__ = ["Tool", "ToolError", "ToolRegistry", "tool"]
 _MAX_ELEMENTS = 2000
+_MAX_ELEMENT_CHARS = 2000
 # Shared default so a caller cannot turn the cap off by passing 0.
 _DEFAULT_RESULT_LIMIT = 20_000
 class ToolError(Exception):
@@ -498,13 +499,42 @@ def _stringify(value: Any, *, limit: int) -> str:
         text = text[:limit] + f"\n... [truncated {omitted} characters; narrow the query]"
     return text
 def _bound_elements(value: Any) -> tuple[Any, str]:
-    """Cap collection sizes before serialisation. Returns the value and a note."""
-    if isinstance(value, list | tuple) and len(value) > _MAX_ELEMENTS:
-        return (
-            list(value[:_MAX_ELEMENTS]),
-            f"[showing the first {_MAX_ELEMENTS} of {len(value)} items]",
-        )
-    if isinstance(value, dict) and len(value) > _MAX_ELEMENTS:
-        kept = dict(list(value.items())[:_MAX_ELEMENTS])
-        return kept, f"[showing the first {_MAX_ELEMENTS} of {len(value)} keys]"
-    return value, ""
+    """Cap collection sizes AND per-element size before serialisation.
+
+    Bounding only the element count still let 2000 elements of 200 KB each be
+    serialized in full -- roughly 400 MB of intermediate string and 0.9 s -- before
+    the character limit threw almost all of it away. Truncating the survivors keeps
+    the work proportional to what the model will actually read.
+    """
+    notes: list[str] = []
+
+    def shrink(item: Any) -> Any:
+        if isinstance(item, str) and len(item) > _MAX_ELEMENT_CHARS:
+            notes.append("long values truncated")
+            return item[:_MAX_ELEMENT_CHARS] + "…"
+        if isinstance(item, dict):
+            return {key: shrink(val) for key, val in item.items()}
+        if isinstance(item, list | tuple):
+            return [shrink(val) for val in item[:_MAX_ELEMENTS]]
+        return item
+
+    if isinstance(value, list | tuple):
+        truncated = len(value) > _MAX_ELEMENTS
+        kept = list(value[:_MAX_ELEMENTS])
+        if truncated:
+            notes.append(f"showing the first {_MAX_ELEMENTS} of {len(value)} items")
+        return [shrink(item) for item in kept], _format_note(notes)
+    if isinstance(value, dict):
+        truncated = len(value) > _MAX_ELEMENTS
+        items = list(value.items())[:_MAX_ELEMENTS]
+        if truncated:
+            notes.append(f"showing the first {_MAX_ELEMENTS} of {len(value)} keys")
+        return {key: shrink(val) for key, val in items}, _format_note(notes)
+    return shrink(value), _format_note(notes)
+
+
+def _format_note(notes: Sequence[str]) -> str:
+    # Deduplicated while keeping order: a collection of 2000 long values would
+    # otherwise repeat the same note 2000 times.
+    unique = list(dict.fromkeys(notes))
+    return f"[{'; '.join(unique)}]" if unique else ""

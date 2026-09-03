@@ -21,6 +21,7 @@ __all__ = [
     "MAX_FILE_BYTES",
     "SENSITIVE_NAMES",
     "discover_files",
+    "is_sensitive_name",
     "looks_binary",
     "read_file",
     "read_text",
@@ -45,7 +46,44 @@ TEXT_SUFFIXES = frozenset(
 # Filenames that are configuration or credentials rather than prose. `.env` in
 # particular holds API keys, and indexing it writes those keys into SQLite where
 # any later retrieval can surface them to a model.
-SENSITIVE_NAMES = frozenset({".env", ".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa", "credentials"})
+SENSITIVE_NAMES = frozenset(
+    {
+        ".netrc", ".pgpass", ".npmrc", ".pypirc", ".git-credentials",
+        "credentials", "token", "tokens",
+        # Exact match, not a prefix: "env*" would also swallow legitimate files
+        # such as environment.md.
+        "env",
+    }
+)
+
+# Exact names are not enough: `.env2`, `config.env`, `Env`, `id_ed25519` and
+# `secrets.yaml` all sailed through an exact-match set and were indexed, keys and
+# all. Match the shapes credential files actually take instead.
+_SENSITIVE_PREFIXES = (".env", "id_", "secret", "credential", "private_key", "keystore")
+_SENSITIVE_SUFFIXES = (
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx", ".gpg", ".asc", ".env",
+)
+
+
+def is_sensitive_name(name: str) -> bool:
+    """True for filenames that plausibly hold credentials.
+
+    Case-insensitive and pattern-based. The cost of a false positive is one file
+    the caller can index explicitly by path; the cost of a false negative is a
+    private key sitting in a searchable database that a model can quote back.
+    """
+    lowered = name.lower()
+    if lowered in SENSITIVE_NAMES:
+        return True
+    # ".env" is matched as a substring, not a prefix or suffix: real names include
+    # `.env.local`, `config.env`, `app.env.sample` and `.env.production.local`.
+    # `environment.md` and `envoy.yaml` contain "env" but not ".env", so the
+    # stricter pattern does not over-block them.
+    if ".env" in lowered:
+        return True
+    if any(lowered.startswith(prefix) for prefix in _SENSITIVE_PREFIXES):
+        return True
+    return any(lowered.endswith(suffix) for suffix in _SENSITIVE_SUFFIXES)
 
 DEFAULT_EXCLUDES = (
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", "dist",
@@ -201,7 +239,7 @@ def discover_files(
             visited.add(key)
 
         for name in sorted(filenames):
-            if name in excludes or name in SENSITIVE_NAMES or name.startswith(".env."):
+            if name in excludes or is_sensitive_name(name):
                 logger.debug("skipping sensitive or excluded file %s", name)
                 continue
             candidate = Path(dirpath) / name
