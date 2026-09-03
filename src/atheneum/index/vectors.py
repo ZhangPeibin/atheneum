@@ -68,11 +68,15 @@ class VectorIndex:
         return array / np.float32(norm)
 
     def add(self, vector: Sequence[float] | np.ndarray) -> int:
-        row = self.normalize(vector)
-        if not np.isfinite(row).all():
-            # A NaN row normalizes to NaN and then silently never matches, so the
-            # chunk quietly disappears from dense retrieval.
+        raw = np.asarray(vector, dtype=np.float32).ravel()
+        # Checked before normalizing: dividing a NaN by its own norm emits a numpy
+        # RuntimeWarning on a path this method handles deliberately, which is noise
+        # in a test run and misleading in a log.
+        if not np.isfinite(raw).all():
+            # A NaN row would normalize to NaN and then silently never match, so the
+            # chunk would quietly disappear from dense retrieval.
             raise ValueError("vectors must be finite; NaN and inf cannot be indexed")
+        row = self.normalize(raw)
         self._dim = self._ensure_dim(row.size)
         self._ensure_capacity(self._count + 1)
         assert self._matrix is not None  # for type checkers; _ensure_capacity set it
