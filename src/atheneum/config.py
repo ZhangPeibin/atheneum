@@ -25,6 +25,12 @@ DB_ENV = "ATHENEUM_DB"
 # colliding with another tool's variable of the same name.
 ENV_PREFIX = "ATHENEUM_"
 
+# Mirrors the strategies each subsystem accepts, so a typo is caught when
+# configuration is loaded rather than at the first query.
+_FUSION_STRATEGIES = frozenset({"rrf", "dbsf", "weighted"})
+_RERANKERS = frozenset({"overlap", "lexical", "cross-encoder", "none", "off"})
+_EMBEDDERS = frozenset({"hashing", "openai", "ollama", "sentence-transformers"})
+
 
 @dataclass(slots=True)
 class Config:
@@ -88,6 +94,21 @@ class Config:
             problems.append(f"token_budget must be >= 1, got {self.token_budget}")
         if self.embedder_dim < 1:
             problems.append(f"embedder_dim must be >= 1, got {self.embedder_dim}")
+        # Validate the enum-shaped settings eagerly. An unknown fusion strategy
+        # used to be accepted here and only failed later, at the first search, so
+        # `ath config` looked fine while every query was broken.
+        if self.fusion not in _FUSION_STRATEGIES:
+            problems.append(
+                f"fusion must be one of {sorted(_FUSION_STRATEGIES)}, got {self.fusion!r}"
+            )
+        if self.reranker is not None and self.reranker not in _RERANKERS:
+            problems.append(
+                f"reranker must be one of {sorted(_RERANKERS)} or null, got {self.reranker!r}"
+            )
+        if self.embedder not in _EMBEDDERS:
+            problems.append(
+                f"embedder must be one of {sorted(_EMBEDDERS)}, got {self.embedder!r}"
+            )
         if problems:
             raise ValueError("invalid configuration: " + "; ".join(problems))
 

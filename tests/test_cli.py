@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from click.testing import CliRunner
@@ -312,3 +313,123 @@ def test_main_wraps_click_errors():
     from atheneum.cli import main
 
     assert callable(main)
+
+
+# ---------------------------------------------------------------------------
+# CLI hardening found by direct probing through the installed binary.
+# ---------------------------------------------------------------------------
+
+
+def test_db_pointing_at_a_directory_is_refused_not_traced(runner, tmp_path):
+    """A destructive flag must fail cleanly, not halfway through deleting."""
+    result = invoke(runner, ["search", "anything"], str(tmp_path))
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "must point at a file" in result.output
+
+
+def test_fresh_refuses_to_unlink_a_directory(runner, tmp_path):
+    target = tmp_path / "adir"
+    target.mkdir()
+    (target / "keep.md").write_text("content", encoding="utf-8")
+    result = invoke(runner, ["index", str(target), "--fresh"], str(target))
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert target.is_dir() and (target / "keep.md").exists(), "--fresh must not delete anything"
+
+
+def test_fresh_replaces_an_existing_database(runner, indexed):
+    source, db = indexed
+    invoke(runner, ["index", source], db)
+    before = json.loads(invoke(runner, ["stats", "--json"], db).output)["chunks"]
+    invoke(runner, ["index", source, "--fresh"], db)
+    after = json.loads(invoke(runner, ["stats", "--json"], db).output)
+    assert after["chunks"] == before
+    assert after["documents"] == 2
+
+
+@pytest.mark.parametrize(
+    ("var", "value", "fragment"),
+    [
+        ("ATHENEUM_FUSION", "magic", "fusion must be one of"),
+        ("ATHENEUM_RERANKER", "bogus", "reranker must be one of"),
+        ("ATHENEUM_EMBEDDER", "nope", "embedder must be one of"),
+    ],
+)
+def test_unknown_enum_settings_fail_when_config_loads(runner, monkeypatch, var, value, fragment):
+    """These used to load fine and only fail at the first query."""
+    monkeypatch.setenv(var, value)
+    result = runner.invoke(cli, ["config"], catch_exceptions=False)
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert fragment in result.output
+
+
+@pytest.mark.parametrize("fusion", ["rrf", "dbsf", "weighted"])
+def test_valid_enum_settings_are_accepted(runner, monkeypatch, fusion):
+    monkeypatch.setenv("ATHENEUM_FUSION", fusion)
+    result = runner.invoke(cli, ["config", "--json"], catch_exceptions=False)
+    assert result.exit_code == 0
+    assert json.loads(result.output)["fusion"] == fusion
+
+
+def test_cli_flag_beats_the_environment(tmp_path):
+    """Documented precedence is defaults < file < env < CLI flags.
+
+    Exercised through the installed console script rather than CliRunner:
+    click's auto_envvar_prefix is set inside main(), so invoking the group
+    object directly does not read ATHENEUM_<COMMAND>_<PARAM> at all and would
+    make this test pass for the wrong reason.
+    """
+    import shutil
+    import subprocess
+    import sys
+
+    executable = shutil.which("ath")
+    if executable is None:  # pragma: no cover - the package is installed in CI
+        pytest.skip("the `ath` console script is not on PATH")
+
+    source = tmp_path / "docs"
+    source.mkdir()
+    for i in range(12):
+        (source / f"d{i}.md").write_text(
+            f"supplementary document {i} about ranking and fusion", encoding="utf-8"
+        )
+    db = str(tmp_path / "prec.db")
+
+    def search(*extra: str, env: dict[str, str] | None = None) -> int:
+        environment = {**os.environ, **(env or {})}
+        completed = subprocess.run(
+            [sys.executable, "-m", "atheneum.cli", "--db", db, "search", "ranking fusion", "--json", *extra],
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            pytest.fail(completed.stdout + completed.stderr)
+        return len(json.loads(completed.stdout))
+
+    assert subprocess.run(
+        [sys.executable, "-m", "atheneum.cli", "--db", db, "index", str(source)],
+        capture_output=True, text=True, timeout=180,
+    ).returncode == 0
+
+    assert search("--top", "7", env={"ATHENEUM_SEARCH_TOP": "2"}) == 7, "flag must beat env"
+    assert search(env={"ATHENEUM_SEARCH_TOP": "2"}) == 2, "env applies when no flag is given"
+    assert search("--top", "3", env={"ATHENEUM_SEARCH_TOP": "9"}) == 3
+
+
+def test_no_command_prints_a_traceback(runner, tmp_path):
+    """Every failure path in the CLI should be one line, never a stack."""
+    cases = [
+        ["search", "x", "--mode", "telepathy"],
+        ["search", "x", "--top", "abc"],
+        ["ask", "x", "-m", "ghost"],
+        ["show", "nothing-matches"],
+        ["rebuild"],
+    ]
+    for args in cases:
+        result = invoke(runner, args, str(tmp_path / "absent.db"))
+        assert result.exit_code != 0, args
+        assert "Traceback" not in result.output, (args, result.output)

@@ -66,6 +66,8 @@ def _open_corpus(ctx: click.Context, *, create: bool = True) -> Corpus:
     options = _opts(ctx)
     config: Config = options["config"]
     db = Path(options["db"])
+    if db.exists() and not db.is_file():
+        raise click.ClickException(f"--db must point at a file, not {db}")
     if not db.exists() and not create:
         raise click.ClickException(f"no corpus at {db}. Run `ath index PATH...` first.")
     embedder = build_embedder(config.embedder, default_dim=config.embedder_dim)
@@ -108,11 +110,18 @@ def index(
     config: Config = options["config"]
     db = Path(options["db"])
 
-    if fresh and db.exists():
-        db.unlink()
-        for sidecar in (Path(str(db) + "-wal"), Path(str(db) + "-shm")):
+    if fresh:
+        # Refuse anything that is not a regular file before deleting. `--db` is
+        # user-supplied, so pointing it at a directory used to reach
+        # Path.unlink() and print a raw PermissionError traceback -- and a
+        # destructive flag that fails halfway is exactly where a mistake costs
+        # something.
+        if db.exists() and not db.is_file():
+            raise click.ClickException(f"--db must point at a file, not {db}")
+        for candidate in (db, Path(str(db) + "-wal"), Path(str(db) + "-shm")):
             with contextlib.suppress(FileNotFoundError):
-                sidecar.unlink()
+                if candidate.is_file():
+                    candidate.unlink()
 
     if chunk_size is not None:
         config.chunk_size = chunk_size
