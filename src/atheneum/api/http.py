@@ -83,6 +83,10 @@ class DocumentIn(BaseModel):
             raise ValueError("source must not contain '..'")
         if value != value.strip():
             raise ValueError("source must not have leading or trailing whitespace")
+        if "//" in value:
+            # An empty path segment is non-canonical: "a//b" and "a/b" would be
+            # two distinct documents that read as the same source in a citation.
+            raise ValueError("source must not contain an empty path segment ('//')")
         return value
 
 
@@ -267,7 +271,12 @@ def create_app(config: Config | None = None) -> Any:
             ]
         return body
 
-    @app.get("/ask/stream", dependencies=[Depends(require_token)])
+    # response_class carries the media type into the schema. The function cannot
+    # be annotated `-> StreamingResponse`: this module defers annotations and the
+    # class is imported inside create_app, so the string never resolves and
+    # /openapi.json raised PydanticUserError, which left /docs and /redoc broken
+    # in the default no-token configuration.
+    @app.get("/ask/stream", dependencies=[Depends(require_token)], response_class=StreamingResponse)
     def ask_stream(
         # Query(...) as a default rather than Annotated: this module defers
         # annotations, and Query is imported inside create_app, so an Annotated
@@ -275,7 +284,7 @@ def create_app(config: Config | None = None) -> Any:
         query: str = Query(min_length=1, max_length=_MAX_QUERY_CHARS),
         top_k: int = Query(5, ge=1, le=100),
         max_turns: int = Query(8, ge=1, le=32),
-    ) -> StreamingResponse:
+    ) -> Any:
         """Stream an answer.
 
         The bounds mirror POST /ask on purpose: without them a caller could ask

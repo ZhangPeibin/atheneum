@@ -110,11 +110,19 @@ class VectorIndex:
         for entry in vectors:
             if isinstance(entry, bytes | bytearray | memoryview):
                 buffer = bytes(entry)
-                if dim is None:
-                    raise DimensionMismatchError("dim is required to decode raw float32 buffers")
-                if len(buffer) != dim * 4:
+                if len(buffer) % 4:
                     raise DimensionMismatchError(
-                        f"buffer of {len(buffer)} bytes does not hold {dim} float32 values"
+                        f"buffer of {len(buffer)} bytes is not a whole number of float32 values"
+                    )
+                # Infer the width from the buffer when the caller did not state it,
+                # so `load(export())` round-trips. Requiring dim made the natural
+                # pairing of the two methods fail outright.
+                width = dim if dim is not None else self._dim
+                if width is None:
+                    width = len(buffer) // 4
+                if len(buffer) != width * 4:
+                    raise DimensionMismatchError(
+                        f"buffer of {len(buffer)} bytes does not hold {width} float32 values"
                     )
                 rows.append(np.frombuffer(buffer, dtype=np.float32).copy())
             else:
@@ -133,11 +141,14 @@ class VectorIndex:
                 f"index was built with dimension {self._dim}; cannot load {width}-d vectors"
             )
         self._dim = width
-        # Normalize on load as well as on add. load() used to store the rows
-        # verbatim, so a non-unit blob made the dot product stop being cosine
-        # similarity: similarities above 1.0 and a different scale from anything
-        # added through add(), which fusion thresholds assume.
-        normalized = [self.normalize(row) for row in rows]
+        # Normalize on load as well as on add: load() used to store rows verbatim,
+        # so a non-unit blob made the dot product stop being cosine similarity.
+        # Already-unit rows are left alone, because normalizing a second time in
+        # float32 perturbs the last bits and near-tied scores could flip order
+        # across an export/load round-trip.
+        normalized = [
+            row if _is_unit(row) else self.normalize(row) for row in rows
+        ]
         for position, row in enumerate(normalized):
             if not np.isfinite(row).all():
                 raise DimensionMismatchError(
@@ -197,6 +208,14 @@ class VectorIndex:
         grown = np.zeros((self._capacity, self._dim), dtype=np.float32)
         grown[: self._count] = self._matrix[: self._count]
         self._matrix = grown
+
+
+def _is_unit(row: np.ndarray, tolerance: float = 1e-6) -> bool:
+    """True when a row is already L2-normalized, so it need not be touched."""
+    if row.size == 0:
+        return False
+    norm = float(np.linalg.norm(row))
+    return abs(norm - 1.0) <= tolerance
 
 
 def _top_k(scores: np.ndarray, top_k: int) -> list[tuple[int, float]]:

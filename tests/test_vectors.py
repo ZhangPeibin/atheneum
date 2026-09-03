@@ -98,9 +98,28 @@ def test_export_and_load_round_trip(index: VectorIndex):
     assert restored.search(_unit(35), top_k=1) == index.search(_unit(35), top_k=1)
 
 
-def test_load_requires_dim_for_raw_buffers():
-    with pytest.raises(DimensionMismatchError):
-        VectorIndex().load([np.asarray([1.0, 0.0], dtype="<f4").tobytes()])
+def test_load_infers_dim_from_raw_buffers():
+    """`load(export())` is the natural pairing and must not require dim.
+
+    Inferring from the buffer length also keeps the round-trip exact: re-normalizing
+    an already-unit float32 row perturbs its last bits, which can flip near-ties.
+    """
+    original = VectorIndex(dim=2)
+    for angle in (0, 30, 60, 90):
+        theta = np.deg2rad(angle)
+        original.add([float(np.cos(theta)), float(np.sin(theta))])
+    before = original.search([1.0, 0.0], top_k=4)
+
+    restored = VectorIndex()
+    restored.load(original.export())
+    assert restored.dim == 2
+    assert len(restored) == 4
+    assert restored.search([1.0, 0.0], top_k=4) == before
+
+
+def test_load_rejects_a_buffer_that_is_not_whole_float32_values():
+    with pytest.raises(DimensionMismatchError, match="whole number"):
+        VectorIndex().load([b"\x01\x02\x03"])
 
 
 def test_load_rejects_wrong_blob_size():

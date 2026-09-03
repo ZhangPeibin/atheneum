@@ -217,3 +217,92 @@ def test_the_corpus_is_closed_on_shutdown(tmp_path):
     again = TestClient(create_app(Config(db=str(tmp_path / "e.db"))))
     with again:
         assert again.get("/stats").json()["chunks"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Security checklist, pinned. Each of these was verified by direct probing and
+# is asserted here so a regression cannot reintroduce it silently.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "trail\n", " pad ", "a\rb", "t\tx", "l\u2028s", "p\u2029s",
+        # A combining mark is not \w, so "é.md" written as e+U+0301 is refused.
+        # That is the safer answer: it cannot alias a precomposed "é.md".
+        "e\u0301.md", "a//b", "a//b/", "..", "/", ".", "", "x" * 513, "nul\x00.md",
+    ],
+)
+def test_hostile_sources_are_rejected(client, source: str):
+    assert client.post("/documents", json={"source": source, "content": "body text"}).status_code == 422
+
+
+@pytest.mark.parametrize("source", ["ok.md", "a+b/c-d_e.md", "中文.md", "x" * 512, "ticket#42"])
+def test_ordinary_sources_are_accepted(client, source: str):
+    assert client.post("/documents", json={"source": source, "content": "body text"}).status_code == 201
+
+
+def test_the_same_source_with_different_content_coexists(client):
+    """Content-addressed ids: this is a documented property, not a collision.
+
+    Two documents under one source make citations ambiguous, which is why
+    `source` is documented as a stable identifier the caller owns.
+    """
+    first = client.post("/documents", json={"source": "ok.md", "content": "AAA"}).json()
+    second = client.post("/documents", json={"source": "ok.md", "content": "BBB"}).json()
+    assert first["doc_id"] != second["doc_id"]
+    assert first["chunks_added"] == second["chunks_added"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"source": "t.md", "content": "x", "title": "T" * 70_000},
+        {"source": "m.md", "content": "x", "metadata": {"k": "v" * 70_000}},
+        {"source": "n.md", "content": "x", "metadata": {"k": {"j": "v" * 70_000}}},
+    ],
+)
+def test_auxiliary_fields_are_capped(client, payload: dict):
+    assert client.post("/documents", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        ("post", "/ask", {"query": "x", "provider": "ghost"}),
+        ("post", "/search", {"query": "x", "mode": "telepathy"}),
+        ("get", "/stats", None),
+        ("get", "/sources", None),
+    ],
+)
+def test_no_error_response_leaks_server_internals(client, call):
+    # `request` is reserved by pytest and cannot be a parametrize argument name.
+    method, path, body = call
+    response = client.post(path, json=body) if method == "post" else client.get(path)
+    text = response.text
+    for needle in ("Traceback", "/Users/", "site-packages", "atheneum.db", "sk-"):
+        assert needle not in text, f"{path} leaked {needle!r}: {text[:200]}"
+
+
+def test_every_sensitive_route_requires_the_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATHENEUM_API_TOKEN", "s3cret")
+    client = TestClient(create_app(Config(db=str(tmp_path / "auth.db"))))
+    with client:
+        assert client.get("/health").status_code == 200
+        for path in ("/stats", "/sources", "/docs", "/redoc", "/openapi.json"):
+            assert client.get(path).status_code in (401, 404), path
+        assert client.get("/ask/stream?query=hi").status_code == 401
+        for path, body in (("/search", {"query": "hi"}), ("/ask", {"query": "hi"})):
+            assert client.post(path, json=body).status_code == 401, path
+        assert client.post("/documents", json={"source": "z.md", "content": "x"}).status_code == 401
+
+        good = {"Authorization": "Bearer s3cret"}
+        assert client.get("/stats", headers=good).status_code == 200
+        for bad in (
+            {"Authorization": "Bearer nope"},
+            {"Authorization": "bearer s3cret"},
+            {"Authorization": "s3cret"},
+            {},
+        ):
+            assert client.get("/stats", headers=bad).status_code == 401, bad
