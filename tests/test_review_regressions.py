@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 import numpy as np
 import pytest
@@ -1000,9 +1001,7 @@ from atheneum.config import Config as _Config  # noqa: E402
 
 
 def _client(tmp_path, name: str) -> TestClient:
-    from pathlib import Path as _P
-
-    return TestClient(create_app(_Config(db=str(_P(tmp_path) / name))))
+    return TestClient(create_app(_Config(db=os.path.join(str(tmp_path), name))))
 
 
 @pytest.mark.parametrize("source", ["trail\n", " pad ", "lead\nline", "tab\tsep"])
@@ -1315,7 +1314,7 @@ def test_cjk_stopwords_are_applied_to_unigrams_only():
 
 def test_giant_title_and_metadata_are_rejected():
     """LOW: only `content` was size-capped; one request grew the db to 34 MB."""
-    client = _client(tmp_path := __import__("tempfile").mkdtemp(), "fields.db")
+    client = _client(tempfile.mkdtemp(), "fields.db")
     with client:
         big = "T" * 8_000_000
         assert client.post("/documents", json={"source": "u.md", "content": "x", "title": big}).status_code == 422
