@@ -287,6 +287,23 @@ Be clear-eyed before you adopt this:
 - **Vector search is exact brute force.** Fine to a few hundred thousand chunks; beyond that, or at
   high dimension, bring an ANN index.
 - **Single-writer SQLite.** Concurrent readers are fine (WAL); concurrent ingesters are not.
+  In-memory indexes are published as one immutable snapshot, so concurrent readers
+  never see a half-built index.
+- **Credential-shaped files are excluded from discovery.** `ath index` skips
+  anything matching `.env` (as a substring, so `.env.local` and `config.env` too),
+  `id_*`, `secret*`, `credential*`, `private_key*`, `keystore*`, and key-file
+  suffixes `.pem .key .p12 .pfx .jks .keystore .kdbx .gpg .asc`, plus an exact list
+  (`.netrc`, `.npmrc`, `.pgpass`, `.pypirc`, `.git-credentials`, `token`, `env`).
+  This is deliberate: an indexed API key lands in SQLite and becomes retrievable,
+  so a model can quote it back inside a cited answer. The asymmetry is intentional —
+  a false positive costs one file you can still index by naming it explicitly
+  (`ath index path/to/.env`), while a false negative puts a private key in a
+  searchable database. `environment.md` and `envoy.yaml` are *not* excluded, since
+  the rule matches `.env` with the dot.
+- **`/documents` accepts text, never a filesystem path**, and `source` is an
+  identifier the caller owns: two documents posted under the same `source` with
+  different content coexist under distinct content-addressed ids, which makes
+  citations for that source ambiguous. Post one canonical version per source.
 - **PDF, DOCX and images are not parsed.** Text formats only. A document parser is a documented
   extension point, not a TODO.
 - **No web search tool.** Everything here is over what you have indexed.
