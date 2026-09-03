@@ -129,7 +129,9 @@ score fusion) and `weighted` are available when you do want magnitude to matter.
 
 **Chunking.** Hierarchical: headings → paragraphs → sentences → characters, with a 200-character
 overlap and code fences kept intact. Overlap larger than chunk size is rejected at construction,
-because that combination makes packing loop forever.
+because that combination makes packing loop forever. Undersized pieces are *merged* into a
+neighbour, never dropped — an earlier version filtered them out, which silently discarded 73% of
+the text for some inputs. Content preservation outranks chunk-size tidiness.
 
 **Re-ranking.** Opt-in. `overlap` is a free deterministic coverage re-scorer; `cross-encoder` uses
 sentence-transformers if you installed it.
