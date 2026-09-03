@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import itertools
 import json
 import os
 import subprocess
@@ -305,8 +306,11 @@ def test_a_raising_repr_does_not_abort_the_run():
     result = ToolRegistry([tool(returns_unprintable)]).execute(
         ToolCall(id="c", name="returns_unprintable", arguments={})
     )
-    assert result.is_error
-    assert "could not be serialised" in result.content
+    # Serialisation degrades to a typed marker instead of raising, so the run
+    # continues and nothing from the hostile __repr__ reaches the model.
+    assert not result.is_error
+    assert "unserialisable" in result.content
+    assert "cannot represent" not in result.content
 
 
 @pytest.mark.parametrize("raw", ["1e999", "nan", "Infinity", "-Infinity", "NaN"])
@@ -789,3 +793,265 @@ def test_store_reads_are_serialized_with_writes(tmp_path):
         thread.join(timeout=20)
     assert not errors, errors
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 6 — resource bounds on ingest and tool results
+# ---------------------------------------------------------------------------
+
+
+def test_add_paths_streams_instead_of_materialising_every_document(tmp_path):
+    """LOW: the full Document list was built up front, so a big tree was held in RAM."""
+    import inspect
+
+    from atheneum.retrieval.pipeline import Corpus
+
+    source = inspect.getsource(Corpus.add_paths)
+    assert "def stream()" in source, "add_paths should build a lazy generator"
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for i in range(12):
+        (tree / f"n{i}.md").write_text(f"document number {i} has content", encoding="utf-8")
+    corpus = Corpus.in_memory()
+    assert corpus.add_paths([tree]) == 12
+    assert corpus.stats()["documents"] == 12
+    assert corpus.add_paths([tree], limit=3) == 0  # already indexed
+    corpus.close()
+
+
+def test_add_paths_respects_limit_without_reading_extra_files(tmp_path):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for i in range(10):
+        (tree / f"n{i}.md").write_text(f"document number {i} has content", encoding="utf-8")
+    corpus = Corpus.in_memory()
+    assert corpus.stats()["documents"] == 0
+    corpus.add_paths([tree], limit=3)
+    assert corpus.stats()["documents"] == 3
+    corpus.close()
+
+
+def test_a_huge_tool_result_is_bounded_before_serialisation():
+    """LOW: json.dumps ran to completion and only then got truncated."""
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    def big(n: int) -> list:
+        """Returns many items."""
+        return list(range(n))
+
+    result = ToolRegistry([tool(big)]).execute(ToolCall(id="c", name="big", arguments={"n": 500_000}))
+    assert not result.is_error
+    assert len(result.content) < 20_000
+    assert "showing the first" in result.content
+
+
+def test_a_huge_dict_result_is_bounded_too():
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    def wide(n: int) -> dict:
+        """Returns many keys."""
+        return {f"key{i}": i for i in range(n)}
+
+    result = ToolRegistry([tool(wide)]).execute(ToolCall(id="c", name="wide", arguments={"n": 100_000}))
+    assert not result.is_error
+    # The element-bound note is prefixed, so character truncation cannot cut it.
+    assert result.content.startswith("[showing the first")
+    assert "keys]" in result.content[:80]
+    assert len(result.content) < 200_000
+
+
+def test_an_unserialisable_result_never_calls_repr():
+    """NIT: json.dumps(default=str) fell back to repr, leaking internals."""
+    from atheneum.agent.tools import ToolRegistry, tool
+
+    class Hostile:
+        def __repr__(self) -> str:
+            raise RuntimeError("no repr for you")
+
+    def returns_hostile() -> object:
+        """Returns something json cannot handle."""
+        return {"k": Hostile()}
+
+    result = ToolRegistry([tool(returns_hostile)]).execute(
+        ToolCall(id="c", name="returns_hostile", arguments={})
+    )
+    # The serializer's own failure text must not be forwarded: str() falls back to
+    # __repr__, so a hostile object could otherwise write into model-visible output.
+    assert "no repr for you" not in result.content
+    assert "unserialisable" in result.content
+
+
+# ---------------------------------------------------------------------------
+# Round 7 — Anthropic wire format (1 blocker) and HTTP API hardening
+# ---------------------------------------------------------------------------
+
+from atheneum.providers.anthropic import _build_messages, _coerce_input, _decode  # noqa: E402
+
+
+def test_parallel_tool_results_share_one_user_message():
+    """BLOCKER: two results became two adjacent user messages -> HTTP 400.
+
+    Anthropic requires alternating roles, so any turn with parallel tool calls
+    was rejected outright.
+    """
+    messages = [
+        Message.assistant("", [ToolCall(id="t1", name="a", arguments={}), ToolCall(id="t2", name="b", arguments={})]),
+        Message.tool(ToolResult(call_id="t1", name="a", content="r1")),
+        Message.tool(ToolResult(call_id="t2", name="b", content="r2", is_error=True)),
+    ]
+    encoded = _build_messages(messages)
+    assert [m["role"] for m in encoded] == ["assistant", "user"]
+    assert len(encoded[-1]["content"]) == 2
+    assert [b["is_error"] for b in encoded[-1]["content"]] == [False, True]
+
+
+def test_no_two_adjacent_messages_share_a_role():
+    cases = [
+        [Message.assistant("a"), Message.user(""), Message.assistant("b")],
+        [Message.assistant("x"), Message.assistant("y")],
+        [Message.user("p"), Message.user("q")],
+        [Message.assistant("", [ToolCall(id="t", name="a", arguments={})]),
+         Message.tool(ToolResult(call_id="t", name="a", content="r")),
+         Message.tool(ToolResult(call_id="t2", name="b", content="r2")),
+         Message.assistant("done")],
+    ]
+    for messages in cases:
+        roles = [m["role"] for m in _build_messages(messages)]
+        assert all(a != b for a, b in itertools.pairwise(roles)), roles
+
+
+def test_is_error_comes_from_the_flag_not_the_text():
+    """Sniffing for a leading '{"error"' misfired in both directions."""
+    call = Message.assistant("", [ToolCall(id="t", name="a", arguments={})])
+
+    false_positive = _build_messages(
+        [call, Message.tool(ToolResult(call_id="t", name="a", content='{"error handling": "documented"}'))]
+    )[-1]["content"][0]
+    assert false_positive["is_error"] is False
+
+    false_negative = _build_messages(
+        [call, Message.tool(ToolResult(call_id="t", name="a", content="Error: file not found", is_error=True))]
+    )[-1]["content"][0]
+    assert false_negative["is_error"] is True
+
+
+def test_tool_input_arriving_as_a_json_string_is_parsed():
+    """MAJOR: dict() on a string raised ValueError and crashed complete()."""
+    assert _coerce_input('{"a": 1}') == {"a": 1}
+    assert _coerce_input({"a": 1}) == {"a": 1}
+    assert _coerce_input(None) == {}
+    bad = _coerce_input("not json")
+    assert bad["_raw"] == "not json" and "_parse_error" in bad
+
+    generation = _decode(
+        "m",
+        {"content": [{"type": "tool_use", "id": "x", "name": "n", "input": '{"a": 1}'}],
+         "stop_reason": "tool_use", "usage": {}},
+    )
+    assert generation.tool_calls[0].arguments == {"a": 1}
+    assert generation.finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [("end_turn", "stop"), ("max_tokens", "length"), ("pause_turn", "error"), ("refusal", "error")],
+)
+def test_stop_reason_is_not_flattened_to_stop(stop_reason: str, expected: str):
+    """pause_turn means "continue" and refusal means "declined"; neither is an answer."""
+    generation = _decode(
+        "m", {"content": [{"type": "text", "text": "hi"}], "stop_reason": stop_reason, "usage": {}}
+    )
+    assert generation.finish_reason == expected
+
+
+def test_thinking_and_unknown_blocks_are_ignored_without_raising():
+    generation = _decode(
+        "m",
+        {
+            "content": [
+                {"type": "thinking", "thinking": "internal"},
+                {"type": "something-new", "data": 1},
+                {"type": "text", "text": "visible"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 4},
+        },
+    )
+    assert generation.text == "visible"
+    assert generation.usage.total_tokens == 7
+
+
+def test_message_carries_is_error_from_its_tool_result():
+    message = Message.tool(ToolResult(call_id="c", name="search", content="boom", is_error=True))
+    assert message.is_error is True
+    assert message.to_dict()["is_error"] is True
+    assert Message.user("x").to_dict().get("is_error") is None
+
+
+# --- HTTP API hardening ----------------------------------------------------
+
+pytest.importorskip("fastapi")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from atheneum.api.http import create_app  # noqa: E402
+from atheneum.config import Config as _Config  # noqa: E402
+
+
+def _client(tmp_path, name: str) -> TestClient:
+    return TestClient(create_app(_Config(db=str(tmp_path / name))))
+
+
+@pytest.mark.parametrize("source", ["trail\n", " pad ", "lead\nline", "tab\tsep"])
+def test_source_with_whitespace_is_rejected(tmp_path, source: str):
+    """MEDIUM: `$` matched before a trailing newline, so "trail\\n" was stored."""
+    client = _client(tmp_path, "ws.db")
+    with client:
+        assert client.post("/documents", json={"source": source, "content": "body"}).status_code == 422
+
+
+def test_streaming_endpoint_parameters_are_bounded(tmp_path):
+    """MEDIUM: /ask/stream accepted max_turns=999999 while POST /ask did not."""
+    client = _client(tmp_path, "stream.db")
+    with client:
+        assert client.get("/ask/stream", params={"query": "hi", "max_turns": 999999}).status_code == 422
+        assert client.get("/ask/stream", params={"query": "hi", "top_k": 99999}).status_code == 422
+        assert client.get("/ask/stream", params={"query": ""}).status_code == 422
+        assert client.get("/ask/stream", params={"query": "hi", "max_turns": 4}).status_code == 200
+
+
+def test_a_rejected_body_is_not_echoed_back(tmp_path):
+    """LOW: the default handler reflected 5 MB of input in a 422 response."""
+    client = _client(tmp_path, "echo.db")
+    with client:
+        response = client.post("/documents", json={"source": "big.md", "content": "x" * (5 * 1024 * 1024)})
+        assert response.status_code == 422
+        assert len(response.content) < 2000
+
+
+def test_the_content_limit_is_bytes_not_characters(tmp_path):
+    """LOW: 4.19M CJK characters is a 12.6 MB body and used to be accepted."""
+    client = _client(tmp_path, "bytes.db")
+    with client:
+        response = client.post("/documents", json={"source": "cjk.md", "content": "中" * (2 * 1024 * 1024)})
+        assert response.status_code == 422
+        assert "bytes" in response.text
+
+
+def test_interactive_docs_are_disabled_when_auth_is_on(tmp_path, monkeypatch):
+    """LOW: /docs and /redoc were reachable unauthenticated with a token set."""
+    monkeypatch.setenv("ATHENEUM_API_TOKEN", "s3cret")
+    client = _client(tmp_path, "docs.db")
+    with client:
+        assert client.get("/docs").status_code == 404
+        assert client.get("/redoc").status_code == 404
+        assert client.get("/openapi.json").status_code == 404
+        assert client.get("/health").status_code == 200
+
+
+def test_a_whitespace_only_token_does_not_fake_auth(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATHENEUM_API_TOKEN", "   ")
+    client = _client(tmp_path, "blank.db")
+    with client:
+        assert client.get("/health").json()["auth"] is False
+        assert client.get("/stats").status_code == 200

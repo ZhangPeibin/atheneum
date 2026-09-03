@@ -8,6 +8,7 @@ the CLI is for.
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 from collections.abc import AsyncIterator, Iterator
@@ -24,14 +25,30 @@ from atheneum.retrieval.pipeline import Corpus
 SearchMode = Literal["hybrid", "lexical", "vector"]
 
 _MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
-_SOURCE_RE = re.compile(r"^[\w][\w./\-+#]{0,511}$", re.UNICODE)
+_MAX_QUERY_CHARS = 8000
+# \Z, not $: in Python `$` also matches immediately before a trailing newline, so
+# a source of "notes.md\n" passed validation and was stored with the newline
+# intact, which is exactly the forged-citation case the validator exists to stop.
+_SOURCE_RE = re.compile(r"\A[\w][\w./\-+#]{0,511}\Z", re.UNICODE)
 
 
 class DocumentIn(BaseModel):
     source: str = Field(..., description="Stable identifier for the document, not a server path.")
-    content: str = Field(..., min_length=1, max_length=_MAX_DOCUMENT_BYTES)
+    content: str = Field(..., min_length=1)
     title: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content_size(cls, value: str) -> str:
+        # Measured in UTF-8 bytes. A character count let 4.19M CJK characters --
+        # a 12.6 MB body -- through a limit named _MAX_DOCUMENT_BYTES.
+        encoded = len(value.encode("utf-8"))
+        if encoded > _MAX_DOCUMENT_BYTES:
+            raise ValueError(
+                f"content is {encoded} bytes, over the {_MAX_DOCUMENT_BYTES} byte limit"
+            )
+        return value
 
     @field_validator("source")
     @classmethod
@@ -45,6 +62,8 @@ class DocumentIn(BaseModel):
             )
         if ".." in value:
             raise ValueError("source must not contain '..'")
+        if value != value.strip():
+            raise ValueError("source must not have leading or trailing whitespace")
         return value
 
 
@@ -105,20 +124,29 @@ def create_app(config: Config | None = None) -> Any:
     breaking ``import atheneum``.
     """
     try:
-        from fastapi import Depends, FastAPI, Header, HTTPException
-        from fastapi.responses import StreamingResponse
+        from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+        from fastapi.exceptions import RequestValidationError
+        from fastapi.responses import JSONResponse, StreamingResponse
     except ImportError as exc:  # pragma: no cover - depends on extras
         raise RuntimeError("the HTTP API needs the `api` extra: pip install atheneum[api]") from exc
 
     settings = config or load_config()
+    docs_enabled = not (os.environ.get("ATHENEUM_API_TOKEN") or "").strip()
     app = FastAPI(
         title="Atheneum",
         version=atheneum.__version__,
         summary="Local-first hybrid retrieval and cited answers.",
         lifespan=_lifespan,
+        # /docs and /redoc were reachable unauthenticated even with a token set,
+        # which publishes the whole schema on any non-loopback bind.
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
     )
     app.state.context = AppContext(settings)
-    token = os.environ.get("ATHENEUM_API_TOKEN") or ""
+    # A whitespace-only value would otherwise "enable" auth with a secret of " ",
+    # which is worse than no auth because it looks protected.
+    token = (os.environ.get("ATHENEUM_API_TOKEN") or "").strip()
 
     def require_token(authorization: str | None = Header(default=None)) -> None:
         """Optional bearer auth.
@@ -128,9 +156,31 @@ def create_app(config: Config | None = None) -> Any:
         """
         if not token:
             return
-        expected = f"Bearer {token}"
-        if authorization != expected:
+        supplied = authorization or ""
+        # compare_digest, not `!=`: a plain string comparison short-circuits on
+        # the first differing byte, which leaks the prefix length.
+        if not hmac.compare_digest(supplied.encode("utf-8"), f"Bearer {token}".encode()):
             raise HTTPException(status_code=401, detail="missing or invalid bearer token")
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        """Report what failed without echoing the payload.
+
+        Pydantic's default handler includes the rejected value, so a 5 MB body
+        produced a 5 MB response -- a free amplification primitive, and the whole
+        document written into the server's error stream.
+        """
+        errors = []
+        for error in exc.errors():
+            location = ".".join(str(part) for part in error.get("loc", ()))
+            errors.append(
+                {
+                    "field": location,
+                    "message": error.get("msg", ""),
+                    "type": error.get("type", ""),
+                }
+            )
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -196,7 +246,20 @@ def create_app(config: Config | None = None) -> Any:
         return body
 
     @app.get("/ask/stream", dependencies=[Depends(require_token)])
-    def ask_stream(query: str, top_k: int = 5, max_turns: int = 8) -> StreamingResponse:
+    def ask_stream(
+        # Query(...) as a default rather than Annotated: this module defers
+        # annotations, and Query is imported inside create_app, so an Annotated
+        # form becomes an unresolvable ForwardRef at schema-build time.
+        query: str = Query(min_length=1, max_length=_MAX_QUERY_CHARS),
+        top_k: int = Query(5, ge=1, le=100),
+        max_turns: int = Query(8, ge=1, le=32),
+    ) -> StreamingResponse:
+        """Stream an answer.
+
+        The bounds mirror POST /ask on purpose: without them a caller could ask
+        for max_turns=999999 and drive an unbounded, client-controlled spend
+        against a real provider.
+        """
         from atheneum.agent.builtin_tools import build_corpus_tools
         from atheneum.agent.loop import Agent, AgentConfig
 
@@ -211,7 +274,7 @@ def create_app(config: Config | None = None) -> Any:
         )
 
     @app.get("/sources", dependencies=[Depends(require_token)])
-    def list_sources(limit: int = 50) -> dict[str, Any]:
+    def list_sources(limit: int = Query(50, ge=1, le=1000)) -> dict[str, Any]:
         bounded = max(1, min(limit, 1000))
         return {"sources": app.state.context.corpus.sources(limit=bounded)}
 

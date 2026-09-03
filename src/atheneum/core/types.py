@@ -146,6 +146,11 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    # Carried explicitly because Anthropic needs a real is_error flag on the
+    # tool_result block. Inferring it from the content string misfired both ways:
+    # a success result documenting an error schema read as a failure, and a
+    # genuine failure written as plain text read as a success.
+    is_error: bool = False
     created_at: float = field(default_factory=time.time)
 
     @classmethod
@@ -167,6 +172,7 @@ class Message:
             content=result.content,
             tool_call_id=result.call_id,
             name=result.name,
+            is_error=result.is_error,
         )
 
     @property
@@ -183,4 +189,6 @@ class Message:
             data["tool_call_id"] = self.tool_call_id
         if self.name:
             data["name"] = self.name
+        if self.role is Role.TOOL:
+            data["is_error"] = self.is_error
         return data

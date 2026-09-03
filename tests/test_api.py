@@ -159,7 +159,10 @@ def test_sources_endpoint(client):
 
 
 def test_sources_limit_is_bounded(client):
-    assert client.get("/sources?limit=0").status_code == 200
+    """limit=0 used to be silently clamped; it is now rejected as out of range."""
+    assert client.get("/sources?limit=0").status_code == 422
+    assert client.get("/sources?limit=1").status_code == 200
+    assert client.get("/sources?limit=5000").status_code == 422
 
 
 # -- streaming --------------------------------------------------------------

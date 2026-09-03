@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -251,20 +251,28 @@ class Corpus:
         """
         from atheneum.ingest import discover_files, read_file
 
-        documents: list[Document] = []
-        for root in paths:
-            for found in discover_files(Path(root), patterns=patterns, exclude=exclude):
-                # Checked before reading, not after: `limit=0` used to index one
-                # whole file because the test happened once the append was done.
-                if limit is not None and len(documents) >= limit:
-                    break
-                try:
-                    documents.append(read_file(found))
-                except Exception as exc:
-                    logger.warning("skipping %s: %s", found, exc)
-            if limit is not None and len(documents) >= limit:
-                break
-        return self.add_documents(documents) if documents else 0
+        def stream() -> Iterator[Document]:
+            count = 0
+            for root in paths:
+                for found in discover_files(Path(root), patterns=patterns, exclude=exclude):
+                    # Checked before reading, not after: `limit=0` used to index
+                    # one whole file because the test ran once append had happened.
+                    if limit is not None and count >= limit:
+                        return
+                    try:
+                        yield read_file(found)
+                    except Exception as exc:
+                        logger.warning("skipping %s: %s", found, exc)
+                        continue
+                    count += 1
+                if limit is not None and count >= limit:
+                    return
+
+        # A generator, not a list: materialising every Document first meant a
+        # 20,000-file tree at the 8 MB per-file cap could hold gigabytes of text
+        # in memory before the first chunk was written. add_documents already
+        # batches, so it can consume this lazily.
+        return self.add_documents(stream())
 
     def delete_document(self, doc_id: str) -> int:
         # No local bookkeeping needed: the delete bumped structure_revision, and

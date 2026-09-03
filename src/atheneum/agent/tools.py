@@ -447,17 +447,45 @@ def _describe(value: Any, limit: int = 60) -> str:
     return f"{name}({text})"
 
 
+# Serialising a huge collection just to throw most of it away is wasted work, and
+# for a pathological return value it is unbounded. Bounding the element count
+# first keeps the cost proportional to what the model will actually see.
+_MAX_ELEMENTS = 2000
+
+
 def _stringify(value: Any, *, limit: int) -> str:
     if isinstance(value, str):
         text = value
     else:
+        bounded, note = _bound_elements(value)
         try:
-            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        except (TypeError, ValueError):
-            text = repr(value)
+            text = json.dumps(bounded, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            # Never repr(), and never let the serializer's own failure text reach
+            # the model: default=str invokes str(), which falls back to __repr__,
+            # so a raising __repr__ surfaced its message inside the error payload.
+            text = f"<unserialisable {type(value).__name__}>"
+        if note:
+            # Prefixed, not appended: the tail is what character limiting cuts, and
+            # losing the "first 2000 of 500000" note left a truncated result that
+            # did not say it had been reduced.
+            text = f"{note} {text}"
     if limit > 0 and len(text) > limit:
         # Truncation is reported inside the payload so the model knows the
         # result is partial and can narrow its query.
         omitted = len(text) - limit
         text = text[:limit] + f"\n... [truncated {omitted} characters; narrow the query]"
     return text
+
+
+def _bound_elements(value: Any) -> tuple[Any, str]:
+    """Cap collection sizes before serialisation. Returns the value and a note."""
+    if isinstance(value, list | tuple) and len(value) > _MAX_ELEMENTS:
+        return (
+            list(value[:_MAX_ELEMENTS]),
+            f"[showing the first {_MAX_ELEMENTS} of {len(value)} items]",
+        )
+    if isinstance(value, dict) and len(value) > _MAX_ELEMENTS:
+        kept = dict(list(value.items())[:_MAX_ELEMENTS])
+        return kept, f"[showing the first {_MAX_ELEMENTS} of {len(value)} keys]"
+    return value, ""

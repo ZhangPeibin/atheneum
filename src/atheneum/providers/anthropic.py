@@ -12,7 +12,7 @@ import contextlib
 import json
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from atheneum.core.types import Message, Role, ToolCall
@@ -118,13 +118,7 @@ class AnthropicProvider(Provider):
 
     def _payload(self, request: GenerationRequest, *, stream: bool) -> dict[str, Any]:
         system_parts = [m.content for m in request.messages if m.role is Role.SYSTEM and m.content]
-        converted = [
-            block
-            for message in request.messages
-            if message.role is not Role.SYSTEM
-            for block in [_encode(message)]
-            if block is not None
-        ]
+        converted = _build_messages(request.messages)
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_tokens or self.default_max_tokens,
@@ -168,7 +162,15 @@ class AnthropicProvider(Provider):
                     except json.JSONDecodeError:
                         continue
                     kind = event.get("type")
-                    if kind == "content_block_start":
+                    if kind == "message_start":
+                        # Prompt tokens are only reported here; ignoring it left
+                        # streaming cost tracking permanently at zero.
+                        start_usage = (event.get("message") or {}).get("usage") or {}
+                        usage = Usage(
+                            int(start_usage.get("input_tokens", 0) or 0),
+                            int(start_usage.get("output_tokens", 0) or 0),
+                        )
+                    elif kind == "content_block_start":
                         block = event.get("content_block") or {}
                         if block.get("type") == "tool_use":
                             index = int(event.get("index", 0))
@@ -179,11 +181,15 @@ class AnthropicProvider(Provider):
                             yield TextDelta(text=delta["text"])
                         elif delta.get("type") == "input_json_delta":
                             index = int(event.get("index", 0))
-                            if index in blocks:
-                                blocks[index]["input"] += delta.get("partial_json", "")
+                            # A delta for an index that never got a start event
+                            # used to be dropped, losing the tool call entirely.
+                            slot = blocks.setdefault(index, {"id": "", "name": "", "input": ""})
+                            slot["input"] += delta.get("partial_json", "")
                     elif kind == "message_delta":
                         raw = event.get("usage") or {}
                         usage = Usage(usage.prompt_tokens, int(raw.get("output_tokens", 0) or 0))
+                    elif kind == "message_stop":
+                        pass
         finally:
             client.close()
 
@@ -199,31 +205,79 @@ class AnthropicProvider(Provider):
         yield UsageEvent(usage=usage)
 
 
-def _encode(message: Message) -> dict[str, Any] | None:
-    """Map one conversation message onto an Anthropic message object."""
-    if message.role is Role.TOOL:
-        return {
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": message.tool_call_id or "",
-                    "content": message.content,
-                    "is_error": message.content.lstrip().startswith('{"error"'),
-                }
-            ],
-        }
-    role = "assistant" if message.role is Role.ASSISTANT else "user"
-    content: list[dict[str, Any]] = []
+def _blocks_for(message: Message) -> list[dict[str, Any]]:
+    """Blocks contributed by a single non-tool message."""
+    blocks: list[dict[str, Any]] = []
     if message.content:
-        content.append({"type": "text", "text": message.content})
+        blocks.append({"type": "text", "text": message.content})
     for call in message.tool_calls:
-        content.append(
-            {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
-        )
-    if not content:
-        return None
-    return {"role": role, "content": content}
+        blocks.append({"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments})
+    return blocks
+
+
+def _tool_result_block(message: Message) -> dict[str, Any]:
+    # message.is_error is authoritative. Sniffing the text for a leading
+    # '{"error"' misfired in both directions: a passage documenting an error
+    # schema was reported as a failed call, while a real failure rendered as
+    # plain text was reported as a success.
+    return {
+        "type": "tool_result",
+        "tool_use_id": message.tool_call_id or "",
+        "content": message.content,
+        "is_error": message.is_error,
+    }
+
+
+def _build_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
+    """Map a conversation onto Anthropic messages with alternating roles.
+
+    Two rules the previous implementation broke, each of which is an HTTP 400:
+    consecutive tool results became two adjacent ``user`` messages instead of one
+    user message with several tool_result blocks (so any parallel tool call
+    failed), and an empty message was dropped outright, which could leave two
+    adjacent ``assistant`` messages. Merging same-role neighbours fixes both.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if message.role is Role.SYSTEM:
+            continue
+        if message.role is Role.TOOL:
+            block = _tool_result_block(message)
+            last = out[-1] if out else None
+            if last is not None and last["role"] == "user" and _only_tool_results(last["content"]):
+                last["content"].append(block)
+            else:
+                out.append({"role": "user", "content": [block]})
+            continue
+
+        blocks = _blocks_for(message)
+        if not blocks:
+            # Dropping it could put two same-role messages next to each other;
+            # skipping here is fine because the merge keeps roles alternating.
+            continue
+        role = "assistant" if message.role is Role.ASSISTANT else "user"
+        if out and out[-1]["role"] == role:
+            out[-1]["content"].extend(blocks)
+        else:
+            out.append({"role": role, "content": blocks})
+    return out
+
+
+def _only_tool_results(blocks: Sequence[dict[str, Any]]) -> bool:
+    return bool(blocks) and all(b.get("type") == "tool_result" for b in blocks)
+
+
+def _coerce_input(raw: Any) -> dict[str, Any]:
+    """Tool input as an object, or as a JSON string that some gateways emit."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"_raw": raw, "_parse_error": "tool input was not valid JSON"}
+        return parsed if isinstance(parsed, dict) else {"_raw": raw, "_parse_error": "tool input was not an object"}
+    return {}
 
 
 def _decode(model: str, data: dict[str, Any]) -> Generation:
@@ -235,9 +289,9 @@ def _decode(model: str, data: dict[str, Any]) -> Generation:
         elif block.get("type") == "tool_use":
             calls.append(
                 ToolCall(
-                    id=block.get("id", f"toolu_{len(calls)}"),
+                    id=block.get("id") or f"toolu_{len(calls)}",
                     name=block.get("name", ""),
-                    arguments=dict(block.get("input") or {}),
+                    arguments=_coerce_input(block.get("input")),
                 )
             )
     raw_usage = data.get("usage") or {}
@@ -250,6 +304,11 @@ def _decode(model: str, data: dict[str, Any]) -> Generation:
         reason = "tool_calls"
     elif stop_reason == "max_tokens":
         reason = "length"
+    elif stop_reason in {"pause_turn", "refusal"}:
+        # Neither is a completed answer: pause_turn means "send me again to
+        # continue" and refusal means the model declined. Reporting either as
+        # "stop" let the loop present a non-answer as a final one.
+        reason = "error"
     else:
         reason = "stop"
     return Generation(
