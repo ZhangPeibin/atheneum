@@ -133,9 +133,19 @@ class Corpus:
         # deleted rows forces a full reload.
         self._loaded_append = -1
         self._loaded_structure = -1
+        # Snapshot of the three structures, replaced by ONE atomic assignment at
+        # the end of every reload. Readers take it once and use it for the whole
+        # query: rebinding _rows, _bm25 and _vectors separately let a concurrent
+        # reader pair a new row list with an old vector matrix.
+        self._pub: tuple[list[Chunk], BM25Index, VectorIndex] = (self._rows, self._bm25, self._vectors)
+        # Writers only, and never acquired while holding the Store lock. No
+        # maintenance path takes the Store lock underneath it, so refreshes go
+        # one way. invalidate() deliberately takes nothing: taking it there
+        # deadlocked `with store.transaction(): corpus.invalidate()` against a
+        # searcher holding this lock and waiting for the store.
         # Guards the whole load path. Without it two threads calling search()
         # concurrently both observed the same append_revision, both ran
-        # _extend_rows, and both appended -- leaving _rows twice as long as the
+        # extended in place, and both appended -- leaving _rows twice as long as
         # vector matrix and attributing dense hits to the wrong chunks. Store is
         # documented as thread-safe and the HTTP API runs sync endpoints on a
         # thread pool, so this is the normal deployment, not an exotic one.
@@ -301,15 +311,15 @@ class Corpus:
         with self._load_lock:
             if self._loaded and self._up_to_date():
                 return
-            # Re-read under the lock: two threads can both arrive here having
-            # seen the same stale revision, and only one may extend.
-            structure, append = self.store.revisions()
-            if not self._loaded or structure != self._loaded_structure:
-                self._rebuild_rows()
-            elif append != self._loaded_append:
-                self._extend_rows()
-            self._loaded_append = append
-            self._loaded_structure = structure
+            # Always a full rebuild, never an in-place extend. A published index
+            # is therefore never mutated afterwards, which is what lets a reader
+            # hold the previous snapshot safely; mutating in place raced with that
+            # reader and published a BM25 index holding zero documents.
+            self._rebuild_rows()
+            after_structure, after_append = self.store.revisions()
+            self._pub = (self._rows, self._bm25, self._vectors)
+            self._loaded_structure = after_structure
+            self._loaded_append = after_append
 
     def _up_to_date(self) -> bool:
         """True when the in-memory indexes already reflect the store.
@@ -353,41 +363,16 @@ class Corpus:
             )
         self._loaded = True
 
-    def _extend_rows(self) -> None:
-        """Fold in chunks stored since the last load.
-
-        Appending is correct because chunk positions are monotonic, so rows
-        already in memory keep their index in both in-memory structures.
-        """
-        already_loaded = len(self._rows)
-        dim = int(self._vectors.dim or getattr(self.embedder, "dim", 0) or 0)
-        for index, row in enumerate(self.store.iter_rows()):
-            if index < already_loaded:
-                continue
-            self._bm25.add_frequencies(row.term_frequencies)
-            if dim:
-                if row.embedding:
-                    self._vectors.add(_blob_to_list(row.embedding, dim))
-                else:
-                    # A zero vector, not a skip. Skipping desynchronized the
-                    # matrix from _rows by one slot, so every later vector row
-                    # was attributed to the wrong chunk: an incremental search
-                    # returned v4.md where a fresh rebuild returned v5.md at the
-                    # identical score. The three structures must advance together.
-                    self._vectors.add([0.0] * dim)
-                    logger.warning(
-                        "chunk %s has no stored vector; it is invisible to dense retrieval",
-                        row.chunk.id,
-                    )
-            self._rows.append(row.chunk)
-        self._bm25.finalize()
-
     def invalidate(self) -> None:
-        """Force indexes to reload from SQLite on the next search."""
-        with self._load_lock:
-            self._loaded = False
-            self._loaded_append = -1
-            self._loaded_structure = -1
+        """Force indexes to reload from SQLite on the next search.
+
+        Lock-free on purpose. Each assignment is atomic, and taking the writer
+        lock here was one half of a proven deadlock with a caller that was
+        already inside a Store transaction.
+        """
+        self._loaded = False
+        self._loaded_append = -1
+        self._loaded_structure = -1
 
     def configure(self, **overrides: Any) -> CorpusConfig:
         """Update retrieval parameters on a live corpus.
@@ -405,9 +390,13 @@ class Corpus:
                     "under the previous configuration"
                 )
             setattr(cfg, key, value)
-        # BM25 parameters are baked into the built index, so force a rebuild of it.
-        self._bm25 = BM25Index(cfg.bm25)
-        self.invalidate()
+        # Under the writer lock. Swapping the index unlocked let an in-flight
+        # reload republish the old state and leave the corpus permanently
+        # reporting itself fresh with an empty BM25 index.
+        with self._load_lock:
+            self._bm25 = BM25Index(cfg.bm25)
+            self._pub = (self._rows, self._bm25, self._vectors)
+            self.invalidate()
         return cfg
 
     def rebuild(self) -> dict[str, Any]:
@@ -448,9 +437,10 @@ class Corpus:
             for chunks, frequencies, embeddings in prepared:
                 self.store._put_chunk_rows(chunks, frequencies, embeddings)
 
-        self.invalidate()
-        self._rows = []
-        self._ensure_ready()
+        with self._load_lock:
+            self.invalidate()
+            self._rows = []
+            self._ensure_ready()
         return self.stats()
 
     # -- search -------------------------------------------------------------
@@ -476,7 +466,8 @@ class Corpus:
             raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")
 
         self._ensure_ready()
-        if not self._rows:
+        rows, bm25, vectors = self._pub
+        if not rows:
             return []
 
         pool = max(top_k, top_k * (candidate_multiplier or self.config.candidate_multiplier))
@@ -485,12 +476,12 @@ class Corpus:
         raw_scores: dict[str, list[float]] = {}
 
         if mode in ("hybrid", "lexical"):
-            hits = self._lexical(query, pool)
+            hits = self._lexical(query, pool, rows, bm25)
             if hits:
                 ranked_lists["bm25"] = [(c.id, c) for c, _ in hits]
                 raw_scores["bm25"] = [s for _, s in hits]
         if mode in ("hybrid", "vector"):
-            hits = self._vector(query, pool)
+            hits = self._vector(query, pool, rows, vectors)
             if hits:
                 ranked_lists["vector"] = [(c.id, c) for c, _ in hits]
                 raw_scores["vector"] = [s for _, s in hits]
@@ -555,11 +546,27 @@ class Corpus:
         # corpus is empty; keep the fusion order rather than returning nothing.
         return rebuilt or fused
 
-    def _lexical(self, query: str, pool: int) -> list[tuple[Chunk, float]]:
-        return [(self._rows[i], s) for i, s in self._bm25.search(query, top_k=pool) if i < len(self._rows)]
+    def _lexical(
+        self,
+        query: str,
+        pool: int,
+        rows: list[Chunk] | None = None,
+        bm25: BM25Index | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        rows = self._pub[0] if rows is None else rows
+        bm25 = self._pub[1] if bm25 is None else bm25
+        return [(rows[i], s) for i, s in bm25.search(query, top_k=pool) if i < len(rows)]
 
-    def _vector(self, query: str, pool: int) -> list[tuple[Chunk, float]]:
-        if self._vectors.dim is None or len(self._vectors) == 0:
+    def _vector(
+        self,
+        query: str,
+        pool: int,
+        rows: list[Chunk] | None = None,
+        vectors: VectorIndex | None = None,
+    ) -> list[tuple[Chunk, float]]:
+        rows = self._pub[0] if rows is None else rows
+        vectors = self._pub[2] if vectors is None else vectors
+        if vectors.dim is None or len(vectors) == 0:
             return []
         try:
             vector = self.embedder.embed(query)
@@ -568,18 +575,17 @@ class Corpus:
             # should lower answer quality, not fail the request outright.
             logger.warning("embedder failed (%s); continuing with lexical-only results", exc)
             return []
-        return [
-            (self._rows[row], s) for row, s in self._vectors.search(vector, top_k=pool) if row < len(self._rows)
-        ]
+        return [(rows[row], s) for row, s in vectors.search(vector, top_k=pool) if row < len(rows)]
 
     def lexical_scores(self, query: str) -> dict[str, float]:
         """Dense BM25 score per chunk id. Used by the evaluation harness."""
         self._ensure_ready()
-        dense = self._bm25.score_all(query)
+        rows, bm25, _ = self._pub
+        dense = bm25.score_all(query)
         return {
-            self._rows[i].id: float(score)
+            rows[i].id: float(score)
             for i, score in enumerate(dense)
-            if score > 0 and i < len(self._rows)
+            if score > 0 and i < len(rows)
         }
 
     # -- accessors ----------------------------------------------------------
@@ -591,7 +597,7 @@ class Corpus:
 
     def chunks(self) -> list[Chunk]:
         self._ensure_ready()
-        return list(self._rows)
+        return list(self._pub[0])
 
     def stats(self) -> dict[str, Any]:
         info = self.store.stats().as_dict()

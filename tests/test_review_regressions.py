@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from atheneum.agent.loop import Agent, AgentConfig
-from atheneum.agent.tools import ToolRegistry, tool
+from atheneum.agent.tools import Tool, ToolRegistry, tool
 from atheneum.core.types import Message, ToolCall, ToolResult
 from atheneum.index.bm25 import BM25Index
 from atheneum.index.selection import top_k_indices
@@ -1325,3 +1325,239 @@ def test_giant_title_and_metadata_are_rejected():
             == 422
         )
         assert client.get("/health").json().get("auth") is None
+
+
+# ---------------------------------------------------------------------------
+# Round 9 — concurrency, embedding validation, provider pairing
+# ---------------------------------------------------------------------------
+
+from atheneum.index.vectors import DimensionMismatchError  # noqa: E402
+from atheneum.providers.anthropic import _validate_pairing  # noqa: E402
+from atheneum.retrieval.embedders import (  # noqa: E402
+    _validate_matrix,
+    describe,
+)
+
+
+def test_a_published_index_is_never_mutated_under_a_reader(tmp_path):
+    """BLOCKER: search + reconfigure raced and misattributed results."""
+    corpus = Corpus.open(str(tmp_path / "race.db"))
+    for i in range(60):
+        corpus.add_text(f"w{i}.md", f"alpha{i} beta{i} gamma document {i} with body text")
+
+    errors: list[str] = []
+    misattributed: list[str] = []
+
+    def reader() -> None:
+        try:
+            for _ in range(120):
+                for hit in corpus.search("alpha7 beta7", top_k=3):
+                    stored = corpus.get_chunk(hit.chunk.id)
+                    if stored is None or stored.text != hit.text:
+                        misattributed.append(hit.chunk.source)
+        except BaseException as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    def writer() -> None:
+        try:
+            for i in range(40):
+                corpus.add_text(f"x{i}.md", f"alpha{i} inserted material {i} during searching")
+                corpus.configure(fusion_k=61 + i % 5)
+        except BaseException as exc:
+            errors.append(f"writer {type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    threads += [threading.Thread(target=writer) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=45)
+
+    assert not [t for t in threads if t.is_alive()], "a thread hung"
+    assert not errors, errors[:2]
+    assert not misattributed, f"hits attributed to the wrong chunk: {misattributed[:3]}"
+    rows, bm25, vectors = corpus._pub
+    assert len(rows) == len(bm25) == len(vectors) == corpus.store.chunk_count()
+    corpus.close()
+
+
+def test_a_store_transaction_plus_invalidate_does_not_deadlock_a_searcher(tmp_path):
+    """BLOCKER: the refresh lock and the Store lock were taken in opposite orders."""
+    corpus = Corpus.open(str(tmp_path / "dl.db"))
+    corpus.add_text("a.md", "alpha beta content for deadlock probing")
+    corpus.search("alpha", top_k=2)
+    outcome: dict[str, str] = {}
+
+    def writer() -> None:
+        try:
+            for _ in range(60):
+                with corpus.store.transaction():
+                    corpus.store.set_meta("k", "v")
+                    corpus.invalidate()
+            outcome["A"] = "done"
+        except BaseException as exc:
+            outcome["A"] = f"{type(exc).__name__}: {exc}"
+
+    def reader() -> None:
+        try:
+            for _ in range(600):
+                corpus.search("alpha beta", top_k=2)
+            outcome["B"] = "done"
+        except BaseException as exc:
+            outcome["B"] = f"{type(exc).__name__}: {exc}"
+
+    a = threading.Thread(target=writer)
+    b = threading.Thread(target=reader)
+    a.start()
+    b.start()
+    a.join(timeout=25)
+    b.join(timeout=25)
+    assert not a.is_alive() and not b.is_alive(), f"DEADLOCK: {outcome}"
+    assert outcome.get("A") == "done", outcome.get("A")
+    assert outcome.get("B") == "done", outcome.get("B")
+    corpus.close()
+
+
+def test_reconfigure_is_not_lost_by_an_in_flight_reload(tmp_path):
+    """BLOCKER: an unlocked configure() left bm25 empty while rows were stored."""
+    corpus = Corpus.open(str(tmp_path / "cfg.db"))
+    for i in range(30):
+        corpus.add_text(f"d{i}.md", f"unique{i} filler words for the index")
+    corpus.search("unique1", top_k=2)
+    for i in range(25):
+        corpus.configure(fusion_k=61 + i)
+        corpus.add_text(f"l{i}.md", f"later{i} content added after reconfiguring")
+    corpus.search("later5", top_k=2)
+    rows, bm25, _vectors = corpus._pub
+    assert len(bm25) == len(rows) == corpus.store.chunk_count()
+    assert bm25.search("later5", top_k=3), "BM25 index lost the newest chunks"
+    corpus.close()
+
+
+@pytest.mark.parametrize(
+    "rows,texts,dim,fragment",
+    [
+        ([[1.0, 2.0]], ["a", "b"], 2, "1 vectors for 2 inputs"),
+        ([[1.0, 2.0], [1.0]], ["a", "b"], 2, "width 1"),
+        ([[float("nan"), 2.0], [1.0, 2.0]], ["a", "b"], 2, "non-finite"),
+        ([[1.0, 2.0, 3.0], [1.0, 2.0]], ["a", "b"], 2, "width 3"),
+        ("notalist", ["a"], 2, "instead of a list"),
+    ],
+)
+def test_malformed_embedding_matrices_are_rejected(rows, texts, dim, fragment):
+    """BLOCKER (Ollama path): no count or shape check attached wrong vectors."""
+    with pytest.raises(RuntimeError, match=fragment):
+        _validate_matrix(rows, texts, dim)
+
+
+def test_a_float_index_is_not_truncated_onto_the_wrong_row():
+    with pytest.raises(RuntimeError, match="non-integer index"):
+        _ordered_embeddings(
+            [{"index": 1.9, "embedding": [1.0]}, {"index": 0, "embedding": [0.0]}], ["a", "b"]
+        )
+
+
+def test_describe_distinguishes_models_at_the_same_dimension():
+    """MAJOR: a model swap used to look identical, defeating the mismatch guard."""
+    a = OpenAIEmbedder(model="text-embedding-3-small", dim=768)
+    b = OpenAIEmbedder(model="something-else", dim=768, base_url="http://vllm:8000/v1")
+    assert describe(a) != describe(b)
+
+
+def test_load_normalizes_and_refuses_a_foreign_dimension():
+    """MAJOR: load() stored raw blobs, so dot product stopped being cosine."""
+    index = VectorIndex(dim=2)
+    index.load([[3.0, 4.0], [0.0, 2.0]], dim=2)
+    # A (3,4) row loaded raw would score 3.0 against (1,0); normalized it is 0.6.
+    assert index.similarity_to_row(0, [1.0, 0.0]) == pytest.approx(0.6, abs=1e-5)
+    assert max(s for _, s in index.search([1.0, 0.0], top_k=2)) <= 1.0 + 1e-6
+    with pytest.raises(DimensionMismatchError):
+        VectorIndex(dim=4).load([[1.0, 2.0, 3.0]], dim=3)
+
+
+def test_non_finite_vectors_cannot_be_indexed():
+    index = VectorIndex(dim=2)
+    with pytest.raises(ValueError, match="finite"):
+        index.add([float("nan"), 1.0])
+    with pytest.raises(ValueError, match="finite"):
+        index.add([float("inf"), 1.0])
+    assert len(index) == 0
+
+
+@pytest.mark.parametrize(
+    "messages,fragment",
+    [
+        (
+            [
+                Message.assistant(
+                    "", [ToolCall(id="t1", name="a", arguments={}), ToolCall(id="t2", name="b", arguments={})]
+                ),
+                Message.tool(ToolResult(call_id="t1", name="a", content="r")),
+            ],
+            "never answered",
+        ),
+        ([Message.tool(ToolResult(call_id="nope", name="a", content="r"))], "no matching tool call"),
+        (
+            [
+                Message.assistant("", [ToolCall(id="", name="a", arguments={})]),
+                Message.tool(ToolResult(call_id="", name="a", content="r")),
+            ],
+            "empty id",
+        ),
+    ],
+)
+def test_inconsistent_tool_pairing_is_rejected_locally(messages, fragment):
+    """MAJOR: these serialized fine and failed only as a remote HTTP 400."""
+    with pytest.raises(ProviderError, match=fragment):
+        _validate_pairing(messages)
+
+
+def test_a_well_formed_pairing_is_accepted():
+    _validate_pairing(
+        [
+            Message.assistant("", [ToolCall(id="t1", name="a", arguments={})]),
+            Message.tool(ToolResult(call_id="t1", name="a", content="r")),
+        ]
+    )
+
+
+def test_a_non_positive_result_limit_cannot_disable_truncation():
+    """LOW: `result_limit=0` meant "no limit" and returned the whole payload."""
+    def big() -> str:
+        """Returns a very large string."""
+        return "y" * 50_000
+
+    registry = ToolRegistry([tool(big)])
+    for bad in (0, -1):
+        content = registry.execute(
+            ToolCall(id="c", name="big", arguments={}), result_limit=bad
+        ).content
+        assert len(content) < 30_000, f"result_limit={bad} disabled the cap"
+    with pytest.raises(ValueError, match="result_limit must be positive"):
+        AgentConfig(result_limit=0)
+
+
+def test_approval_is_enforced_by_the_registry_not_only_the_loop():
+    """MAJOR: requires_approval was a tool property only one caller honoured."""
+    ran: list[str] = []
+
+    def wipe() -> str:
+        """Destructive."""
+        ran.append("ran")
+        return "wiped"
+
+    registry = ToolRegistry([tool(wipe, name="wipe", requires_approval=True)])
+    direct = registry.execute(ToolCall(id="c", name="wipe", arguments={}))
+    assert direct.is_error and not ran, "execute() ran an approval-required tool"
+    assert json.loads(direct.content)["error"] == "not_approved"
+
+    def broken(_call: ToolCall, _tool: Tool) -> bool:
+        raise RuntimeError("callback exploded")
+
+    assert registry.execute(
+        ToolCall(id="c", name="wipe", arguments={}), approver=broken
+    ).is_error
+    assert not ran, "a raising approver must decline, not approve"
+    assert registry.execute(
+        ToolCall(id="c", name="wipe", arguments={}), approver=lambda _c, _t: True
+    ).content == "wiped"

@@ -69,6 +69,10 @@ class VectorIndex:
 
     def add(self, vector: Sequence[float] | np.ndarray) -> int:
         row = self.normalize(vector)
+        if not np.isfinite(row).all():
+            # A NaN row normalizes to NaN and then silently never matches, so the
+            # chunk quietly disappears from dense retrieval.
+            raise ValueError("vectors must be finite; NaN and inf cannot be indexed")
         self._dim = self._ensure_dim(row.size)
         self._ensure_capacity(self._count + 1)
         assert self._matrix is not None  # for type checkers; _ensure_capacity set it
@@ -122,10 +126,26 @@ class VectorIndex:
                 raise DimensionMismatchError(
                     f"expected dimension {width}, got a vector of size {row.size}"
                 )
+        if self._dim is not None and self._dim != width:
+            # Honour a dim declared at construction rather than silently adopting
+            # whatever the persisted rows happen to have.
+            raise DimensionMismatchError(
+                f"index was built with dimension {self._dim}; cannot load {width}-d vectors"
+            )
         self._dim = width
+        # Normalize on load as well as on add. load() used to store the rows
+        # verbatim, so a non-unit blob made the dot product stop being cosine
+        # similarity: similarities above 1.0 and a different scale from anything
+        # added through add(), which fusion thresholds assume.
+        normalized = [self.normalize(row) for row in rows]
+        for position, row in enumerate(normalized):
+            if not np.isfinite(row).all():
+                raise DimensionMismatchError(
+                    f"row {position} is not finite (NaN or inf) and cannot be indexed"
+                )
         self._count = len(rows)
         self._capacity = len(rows)
-        self._matrix = np.vstack(rows).astype(np.float32, copy=False)
+        self._matrix = np.vstack(normalized).astype(np.float32, copy=False)
 
     def export(self) -> list[bytes]:
         """Serialize rows as raw little-endian float32 buffers."""

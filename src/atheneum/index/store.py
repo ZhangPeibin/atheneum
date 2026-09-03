@@ -139,6 +139,8 @@ class Store:
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        # Depth of nested transaction() blocks; only the outermost BEGINs/COMMITs.
+        self._depth = 0
         self._conn = sqlite3.connect(
             str(self.path),
             detect_types=0,
@@ -177,15 +179,27 @@ class Store:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         conn = self._conn
-        # The lock is reentrant, so nested helpers such as put_document calling
-        # set_meta still work without deadlocking.
         with self._lock:
+            # Nesting is allowed and joins the outermost transaction. Without this
+            # `with store.transaction(): store.set_meta(...)` raised
+            # "cannot start a transaction within a transaction", because the public
+            # mutators open one themselves -- so no public method could be called
+            # inside a caller's atomic block, which made composing writes impossible.
+            self._depth += 1
+            if self._depth > 1:
+                try:
+                    yield conn
+                finally:
+                    self._depth -= 1
+                return
             conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
+            finally:
+                self._depth = 0
             conn.execute("COMMIT")
 
     @contextmanager

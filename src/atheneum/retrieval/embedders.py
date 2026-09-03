@@ -145,6 +145,8 @@ class _HttpEmbedder:
 
     def _post_with_retry(self, url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
         httpx = self._client()
+        if self.max_retries < 1:
+            raise ValueError(f"max_retries must be >= 1, got {self.max_retries}")
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
@@ -173,6 +175,35 @@ class _HttpEmbedder:
         raise RuntimeError(f"embedding request to {url} failed after {self.max_retries} attempts: {last_error}") from last_error
 
 
+def _validate_matrix(rows: Any, texts: Sequence[str], dim: int) -> np.ndarray:
+    """Coerce a provider payload to a (len(texts), dim) finite float matrix.
+
+    Every failure mode here is a silent misattribution if it passes: one row
+    short shifts every later chunk onto its neighbour's embedding, a ragged row
+    becomes an object array, and a NaN or inf vector normalizes to NaN and
+    vanishes from dense retrieval without a word.
+    """
+    if not isinstance(rows, list):
+        raise RuntimeError(f"embedding API returned {type(rows).__name__} instead of a list")
+    if len(rows) != len(texts):
+        raise RuntimeError(f"embedding API returned {len(rows)} vectors for {len(texts)} inputs")
+    matrix = np.empty((len(rows), dim), dtype=np.float32)
+    for position, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) != dim:
+            width = len(row) if isinstance(row, list) else "not-a-list"
+            raise RuntimeError(
+                f"embedding API returned a vector of width {width} for position {position}, expected {dim}"
+            )
+        try:
+            vector = np.asarray(row, dtype=np.float32)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"embedding API returned a non-numeric vector at position {position}") from exc
+        if not np.isfinite(vector).all():
+            raise RuntimeError(f"embedding API returned a non-finite vector at position {position}")
+        matrix[position] = vector
+    return matrix
+
+
 def _ordered_embeddings(items: Any, batch: Sequence[str]) -> list[list[float]]:
     """Put embeddings back into input order using the API's index field.
 
@@ -189,6 +220,11 @@ def _ordered_embeddings(items: Any, batch: Sequence[str]) -> list[list[float]]:
         if not isinstance(item, dict) or "embedding" not in item:
             raise RuntimeError(f"embedding API returned a malformed item at position {position}")
         raw_index = item.get("index", position)
+        if isinstance(raw_index, bool) or not isinstance(raw_index, int | str):
+            # int(1.9) would silently truncate a float index onto the wrong row.
+            raise RuntimeError(
+                f"embedding API returned a non-integer index {raw_index!r} at position {position}"
+            )
         try:
             index = int(raw_index)
         except (TypeError, ValueError) as exc:
@@ -251,16 +287,7 @@ class OpenAIEmbedder(_HttpEmbedder):
                 {"model": self.model, "input": batch},
             )
             rows.extend(_ordered_embeddings(data.get("data"), batch))
-        matrix = np.asarray(rows, dtype=np.float32)
-        if matrix.shape[0] != len(texts):
-            # Without this the caller silently receives the wrong number of
-            # vectors and every later chunk carries its neighbour's embedding --
-            # the same class of silent misattribution as a desynced index, and
-            # far harder to notice because nothing raises.
-            raise RuntimeError(
-                f"embedding API returned {matrix.shape[0]} vectors for {len(texts)} inputs"
-            )
-        return cast("np.ndarray[Any, Any]", matrix)
+        return cast("np.ndarray[Any, Any]", _validate_matrix(rows, texts, self.dim))
 
     def _headers(self) -> dict[str, str]:
         key = self.api_key or os.environ.get("OPENAI_API_KEY")
@@ -300,7 +327,11 @@ class OllamaEmbedder(_HttpEmbedder):
             {"Content-Type": "application/json"},
             {"model": self.model, "input": list(texts)},
         )
-        return cast("np.ndarray[Any, Any]", np.asarray(data["embeddings"], dtype=np.float32))
+        # Ollama has no index field, so order is positional -- which makes the
+        # count check the only defence against attaching one chunk's vector to
+        # another. The OpenAI path got this guard in an earlier fix and this
+        # sibling was left without it.
+        return cast("np.ndarray[Any, Any]", _validate_matrix(data.get("embeddings"), texts, self.dim))
 
 
 class SentenceTransformerEmbedder:
@@ -383,8 +414,19 @@ def iter_batches(items: Iterable[str], size: int) -> Iterable[list[str]]:
 
 
 def describe(embedder: Embedder) -> str:
-    """A stable string identity, used to detect index/embedder mismatches."""
-    return json.dumps(
-        {"name": getattr(embedder, "name", type(embedder).__name__), "dim": embedder.dim},
-        sort_keys=True,
-    )
+    """A stable string identity, used to detect index/embedder mismatches.
+
+    Includes the model and endpoint when the backend has them. Two OpenAI-style
+    models at the same dimension describe identically otherwise, so swapping
+    text-embedding-3-small for a vLLM server of width 768 would silently mix
+    incompatible vector spaces inside one index.
+    """
+    identity: dict[str, Any] = {
+        "name": getattr(embedder, "name", type(embedder).__name__),
+        "dim": embedder.dim,
+    }
+    for attribute in ("model", "base_url", "bigram_weight"):
+        value = getattr(embedder, attribute, None)
+        if value:
+            identity[attribute] = value
+    return json.dumps(identity, sort_keys=True)

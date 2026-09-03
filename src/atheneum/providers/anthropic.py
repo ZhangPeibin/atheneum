@@ -128,6 +128,9 @@ class AnthropicProvider(Provider):
     def _payload(self, request: GenerationRequest, *, stream: bool) -> dict[str, Any]:
         system_parts = [m.content for m in request.messages if m.role is Role.SYSTEM and m.content]
         converted = _build_messages(request.messages)
+        if not converted:
+            raise ProviderError("no non-system messages to send")
+        _validate_pairing(request.messages)
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_tokens or self.default_max_tokens,
@@ -278,8 +281,36 @@ def _build_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
     return out
 
 
-def _only_tool_results(blocks: Sequence[dict[str, Any]]) -> bool:
-    return bool(blocks) and all(b.get("type") == "tool_result" for b in blocks)
+def _validate_pairing(messages: Sequence[Message]) -> None:
+    """Reject a conversation the API would bounce, with a message that says why.
+
+    Every case below serializes cleanly and fails only as a remote HTTP 400,
+    which is useless for debugging: an unanswered tool_use, a tool_result whose
+    id matches no tool_use, and a blank tool_use_id all mean the history this
+    object was handed is inconsistent -- reachable from caller-supplied history
+    and from context compaction dropping an assistant tool-call turn.
+    """
+    issued: set[str] = set()
+    answered: set[str] = set()
+    for message in messages:
+        if message.role is Role.TOOL:
+            if not message.tool_call_id:
+                raise ProviderError(
+                    f"tool result for {message.name or 'unknown'} carries no tool_call_id"
+                )
+            answered.add(message.tool_call_id)
+            continue
+        for call in message.tool_calls:
+            if not call.id:
+                raise ProviderError(f"tool call {call.name!r} has an empty id")
+            issued.add(call.id)
+
+    unanswered = sorted(issued - answered)
+    if unanswered:
+        raise ProviderError(f"tool calls were never answered: {unanswered}")
+    orphaned = sorted(answered - issued)
+    if orphaned:
+        raise ProviderError(f"tool results have no matching tool call: {orphaned}")
 
 
 def _coerce_input(raw: Any) -> dict[str, Any]:

@@ -61,6 +61,8 @@ class AgentConfig:
     # capped at the registry boundary rather than trusting tools to be brief.
     result_limit: int = 20_000
     temperature: float = 0.0
+    # A non-positive limit would remove the context-window guard entirely, so it
+    # is rejected here rather than silently reinterpreted downstream.
     # None means no limit. A tool that blocks on a network call otherwise stalls
     # the run indefinitely: max_turns bounds the number of iterations, not the
     # duration of any one of them.
@@ -69,6 +71,8 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if self.max_turns <= 0:
             raise ValueError(f"max_turns must be positive, got {self.max_turns}")
+        if self.result_limit <= 0:
+            raise ValueError(f"result_limit must be positive, got {self.result_limit}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,7 +399,10 @@ class Agent:
                     results.append(declined)
                     continue
             result = self.tools.execute(
-                call, result_limit=self.config.result_limit, timeout=self.config.tool_timeout
+                call,
+                result_limit=self.config.result_limit,
+                timeout=self.config.tool_timeout,
+                approver=self.confirm,
             )
             memory.add(Message.tool(result))
             logger.debug("turn %d: %s -> error=%s", turn, call.name, result.is_error)
