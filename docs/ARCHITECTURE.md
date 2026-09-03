@@ -116,8 +116,17 @@ studied use them, so they add surface without demonstrated value.
 **Deviations from the reference, both deliberate:**
 
 1. `rank_bm25.get_top_n` uses `np.argsort(scores)[::-1][:n]` — a full O(n log n)
-   sort. `index/bm25.py` uses `np.argpartition` for O(n) pre-selection and sorts
-   only the winning slice.
+   sort, with no defined tie order. `index/selection.py::top_k_indices` partitions
+   only to find the k-th score, then takes every row beating it and fills the
+   remainder from tied rows in ascending index order.
+
+   An intermediate version used `np.argpartition` directly and was *also* wrong,
+   in a subtler way: argpartition returns the right number of top elements but
+   chooses arbitrarily among ties, and sorting afterwards fixed the order of the
+   chosen few without fixing which few were chosen. Ten identical rows asked for
+   the top four returned rows 4, 6, 7 and 8. Because reproducible ranking is a
+   stated guarantee, ties now resolve to the lowest index in both retrievers
+   through one shared function.
 2. `rank_bm25.BM25._tokenize_corpus` spawns `multiprocessing.Pool(cpu_count())`.
    For a corpus of a few hundred chunks that costs more than it saves, and a
    tokenizer that is a closure cannot be pickled at all under macOS spawn
@@ -153,9 +162,18 @@ That is exact search at a latency where an ANN index would be pure overhead.
 **Conclusion.** `text/splitter.py` uses the same cascade (heading → paragraph →
 sentence → hard cut), the same 200-character overlap default, and the same
 construction-time validation. CJK terminators `。！？；` are first-class in the
-sentence regex. Two additions: complete fenced code blocks are emitted whole even
+sentence regex. Three additions: complete fenced code blocks are emitted whole even
 past the budget, because a fragment of a function body is worse than a long chunk;
-and `respect_code_fences=False` opts out.
+`respect_code_fences=False` opts out; and undersized pieces are *merged* into a
+neighbour rather than filtered out.
+
+That last one came from adversarial review, not from the literature. A
+`min_chunk_chars` filter with an `or pieces[:1]` fallback looked like tidy
+normalisation and was in fact silent data loss: with `chunk_size=20` and
+`overlap=19`, a 240-character input produced 240 short pieces, every one was
+filtered, and the fallback kept a single 20-character chunk — 73% of the document
+vanished from the index with nothing logged. **Content preservation outranks chunk
+size tidiness**, so `min_chunk_chars` now only controls merging.
 
 ### Tokenization
 
@@ -355,9 +373,10 @@ src/atheneum/
 ├── core/types.py          Document, Chunk, Message, ToolCall, ToolResult — no I/O, no deps
 ├── text/tokenizer.py      CJK-aware terms: word tokens + Han bigrams, NFKC→NFD→NFC folding
 ├── text/splitter.py       heading → paragraph → sentence → hard cut, code fences atomic
-├── index/bm25.py          Okapi BM25 over an inverted index, argpartition top-k
+├── index/bm25.py          Okapi BM25 over an inverted index
+├── index/selection.py     deterministic top-k shared by both retrievers (ties -> lowest index)
 ├── index/vectors.py       packed float32 matrix, normalized rows, one matmul per query
-├── index/store.py         SQLite schema + migrations, thread-safe, WAL
+├── index/store.py         SQLite schema + migrations, WAL, lock-guarded, revision counters
 ├── ingest.py              file discovery, encoding detection, binary rejection
 ├── retrieval/embedders.py hashing (default, offline) + OpenAI/Ollama/ST backends
 ├── retrieval/fusion.py    RRF (k=61), DBSF, weighted sum
@@ -377,6 +396,14 @@ src/atheneum/
 ├── api/http.py            FastAPI, bearer auth, SSE streaming
 └── cli.py                 ath index|search|ask|chat|serve|eval|bench|...
 ```
+
+`index/store.py` keeps two revision counters, `append_revision` and
+`structure_revision`, so an in-memory index can distinguish "rows were appended"
+(fold in cheaply) from "rows were deleted" (the positional alignment between the
+BM25 index, the vector matrix and the chunk list is gone; reload everything).
+One counter would have forced a full reload after every write; none at all let a
+second process's delete go unnoticed, which made search attribute results to the
+wrong chunks.
 
 Hard dependencies are **click** and **numpy**. `httpx`, `fastapi` and `uvicorn` are
 extras. Nothing else is imported at startup — `sentence_transformers` and `torch`

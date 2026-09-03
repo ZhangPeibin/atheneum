@@ -111,7 +111,11 @@ query ──┬──► tokenizer (CJK-aware) ──► BM25 inverted index ─
 **BM25.** Okapi with `k1=1.5`, `b=0.75`, and the negative-IDF floor at `epsilon=0.25 × average_idf`
 so that terms appearing in more than half the corpus cannot penalise the documents holding them.
 Scoring gathers postings for the query terms only, so cost scales with matching chunks rather than
-corpus size, and top-k uses `argpartition` instead of a full sort.
+corpus size. Top-k selection lives in `index/selection.py` and is shared by both
+retrievers: it partitions only to find the k-th score, then takes every row beating
+it and fills the remainder from tied rows in ascending index order. `argpartition`
+alone was not enough — it returns the right *count* but chooses arbitrarily among
+ties, so ten identical rows asked for the top four returned rows 4, 6, 7 and 8.
 
 **Dense vectors.** Stored as packed float32 rows in SQLite and loaded into one contiguous numpy
 matrix, so a query is a single matrix-vector product — no per-row function call per candidate. Rows
@@ -134,7 +138,8 @@ sentence-transformers if you installed it.
 
 FTS5's `bm25()` is excellent and would remove this module entirely, but its `unicode61` tokenizer does
 not segment Han characters into words, and swapping in a real segmenter reintroduces a dependency.
-Owning the scorer costs ~250 lines, gives identical ranking for Latin text, and stays correct for
+Owning the scorer costs ~290 lines across `index/bm25.py` and `index/selection.py`, gives identical
+ranking for Latin text, and stays correct for
 Chinese and Japanese. `index/bm25.py` is where to look if you disagree.
 
 ### Why not a vector database?
