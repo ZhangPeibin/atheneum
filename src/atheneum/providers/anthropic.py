@@ -350,10 +350,12 @@ def _decode(model: str, data: dict[str, Any]) -> Generation:
         reason = "tool_calls"
     elif stop_reason == "max_tokens":
         reason = "length"
-    elif stop_reason in {"pause_turn", "refusal"}:
-        # Neither is a completed answer: pause_turn means "send me again to
-        # continue" and refusal means the model declined. Reporting either as
-        # "stop" let the loop present a non-answer as a final one.
+    elif stop_reason == "pause_turn":
+        # Resumable, not failed: the model paused mid-turn and expects the same
+        # conversation back. The loop continues rather than reporting an error.
+        reason = "paused"
+    elif stop_reason == "refusal":
+        # A declined request is not an answer, and must not be presented as one.
         reason = "error"
     else:
         reason = "stop"

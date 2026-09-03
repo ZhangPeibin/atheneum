@@ -27,7 +27,11 @@ __all__ = [
     "Usage",
 ]
 
-FinishReason = Literal["stop", "tool_calls", "length", "error"]
+# "paused" is distinct from "error": Anthropic's pause_turn means the model
+# stopped mid-turn and expects the same conversation to be sent back to continue.
+# Reporting it as an error discarded a recoverable long-running turn; reporting it
+# as "stop" presented half an answer as final. The loop continues on "paused".
+FinishReason = Literal["stop", "tool_calls", "length", "error", "paused"]
 
 
 class ProviderError(RuntimeError):

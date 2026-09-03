@@ -198,11 +198,15 @@ class Agent:
             memory.add(assistant)
 
             if not generation.tool_calls:
+                if generation.finish_reason == "paused":
+                    # The provider stopped mid-turn and wants to be called again
+                    # with the same history. Continue rather than returning half an
+                    # answer; max_turns still bounds it, so this cannot spin.
+                    steps.append(Step(turn=turn, generation=generation))
+                    logger.debug("turn %d: provider paused, continuing", turn)
+                    continue
                 steps.append(Step(turn=turn, generation=generation))
-                # A provider can report that the turn did not really complete --
-                # Anthropic's pause_turn ("call me again to continue") and refusal
-                # both map to finish_reason="error". Treating that as a final
-                # answer presented a non-answer as a result and reported ok=True.
+                # A refusal is not an answer and must not be reported as one.
                 errored = generation.finish_reason == "error"
                 return AgentRun(
                     answer=resolve_final_answer(generation, steps),
@@ -308,6 +312,9 @@ class Agent:
             memory.add(Message.assistant(generation.text, generation.tool_calls))
 
             if not calls:
+                if generation.finish_reason == "paused":
+                    steps.append(Step(turn=turn, generation=generation))
+                    continue
                 steps.append(Step(turn=turn, generation=generation))
                 errored = generation.finish_reason == "error"
                 yield AgentEvent(
