@@ -381,13 +381,8 @@ def test_cli_flag_beats_the_environment(tmp_path):
     object directly does not read ATHENEUM_<COMMAND>_<PARAM> at all and would
     make this test pass for the wrong reason.
     """
-    import shutil
     import subprocess
     import sys
-
-    executable = shutil.which("ath")
-    if executable is None:  # pragma: no cover - the package is installed in CI
-        pytest.skip("the `ath` console script is not on PATH")
 
     source = tmp_path / "docs"
     source.mkdir()
