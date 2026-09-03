@@ -60,6 +60,36 @@ class Config:
             self.db = str(default_db_path())
         if not self.config_dir:
             self.config_dir = str(config_path().parent)
+        self.validate()
+
+    def validate(self) -> None:
+        """Reject settings that cannot work, at construction rather than at query time.
+
+        Without this, `ATHENEUM_TOP_K=0` or a chunk overlap larger than the chunk
+        size were accepted silently and only failed later -- or worse, produced
+        empty results that looked like "no matches".
+        """
+        problems: list[str] = []
+        if self.top_k < 1:
+            problems.append(f"top_k must be >= 1, got {self.top_k}")
+        if self.fusion_k < 1:
+            problems.append(f"fusion_k must be >= 1, got {self.fusion_k}")
+        if self.chunk_size < 1:
+            problems.append(f"chunk_size must be >= 1, got {self.chunk_size}")
+        if self.chunk_overlap < 0:
+            problems.append(f"chunk_overlap must be >= 0, got {self.chunk_overlap}")
+        if self.chunk_overlap >= self.chunk_size:
+            problems.append(
+                f"chunk_overlap ({self.chunk_overlap}) must be smaller than chunk_size ({self.chunk_size})"
+            )
+        if self.max_turns < 1:
+            problems.append(f"max_turns must be >= 1, got {self.max_turns}")
+        if self.token_budget < 1:
+            problems.append(f"token_budget must be >= 1, got {self.token_budget}")
+        if self.embedder_dim < 1:
+            problems.append(f"embedder_dim must be >= 1, got {self.embedder_dim}")
+        if problems:
+            raise ValueError("invalid configuration: " + "; ".join(problems))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,7 +162,14 @@ def load_config(path: str | Path | None = None, *, env: Mapping[str, str] | None
         extra[key] = data.pop(key)
 
     kwargs = {k: v for k, v in data.items() if k in known}
-    return Config(extra=extra, **kwargs)
+    try:
+        return Config(extra=extra, **kwargs)
+    except ValueError as exc:
+        # Name both sources: "invalid configuration" alone does not tell someone
+        # whether to look at their config file or their environment.
+        raise ValueError(
+            f"{exc} (check the config file and any {ENV_PREFIX}* environment variables)"
+        ) from exc
 
 
 def _convert(name: str, raw: str, declared: Any) -> Any:

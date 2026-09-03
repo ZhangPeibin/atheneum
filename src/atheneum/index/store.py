@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import time
 import zlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -244,7 +244,11 @@ class Store:
 
     # -- documents ----------------------------------------------------------
     def put_document(self, document: Document) -> bool:
-        """Insert a document. Returns False if an identical one already exists."""
+        """Insert a document. Returns False if an identical one already exists.
+
+        The existence check happens inside the transaction: doing it outside let
+        two threads both see "absent" and both insert.
+        """
         with self.transaction():
             return self._put_document_row(document)
 
@@ -269,10 +273,11 @@ class Store:
         return True
 
     def get_document(self, doc_id: str) -> Document | None:
-        row = self._conn.execute(
-            "SELECT source, title, mime_type, content, metadata FROM documents WHERE id = ?",
-            (doc_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT source, title, mime_type, content, metadata FROM documents WHERE id = ?",
+                (doc_id,),
+            ).fetchone()
         if row is None:
             return None
         return Document(
@@ -284,19 +289,21 @@ class Store:
         )
 
     def find_document_by_source(self, source: str) -> Document | None:
-        row = self._conn.execute(
-            "SELECT id FROM documents WHERE source = ? ORDER BY added_at DESC LIMIT 1",
-            (source,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM documents WHERE source = ? ORDER BY added_at DESC LIMIT 1",
+                (source,),
+            ).fetchone()
         return self.get_document(row["id"]) if row else None
 
     def list_documents(self, limit: int = 100) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        with self._lock:
+            rows = self._conn.execute(
             "SELECT d.id, d.source, d.title, d.added_at, "
             "       (SELECT COUNT(*) FROM chunks c WHERE c.doc_id = d.id) AS chunk_count "
-            "FROM documents d ORDER BY d.added_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+                "FROM documents d ORDER BY d.added_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def delete_document(self, doc_id: str) -> int:
@@ -386,10 +393,16 @@ class Store:
         return positions
 
     def chunk_count(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"])
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"])
 
-    def iter_rows(self, batch_size: int = 500) -> Iterable[StoredRow]:
-        """Stream every chunk in positional order."""
+    def iter_rows(self, batch_size: int = 500) -> list[StoredRow]:
+        """Every chunk in positional order.
+
+        Rows are materialised under the lock and yielded outside it. Holding the
+        lock across a yield let a slow consumer block every writer for as long as
+        it liked, which is the opposite of what WAL mode is for.
+        """
         with self.cursor() as cur:
             cur.execute(
                 "SELECT c.pos, c.id, c.doc_id, c.source, c.ordinal, c.text, c.metadata, c.tf, "
@@ -397,30 +410,30 @@ class Store:
                 "FROM chunks c LEFT JOIN vectors v ON v.pos = c.pos "
                 "ORDER BY c.pos"
             )
-            while True:
-                rows = cur.fetchmany(batch_size)
-                if not rows:
-                    break
-                for row in rows:
-                    yield StoredRow(
-                        pos=int(row["pos"]),
-                        chunk=Chunk(
-                            id=row["id"],
-                            doc_id=row["doc_id"],
-                            source=row["source"],
-                            ordinal=int(row["ordinal"]),
-                            text=row["text"],
-                            metadata=json.loads(row["metadata"]),
-                        ),
-                        term_frequencies=decode_term_frequencies(row["tf"]),
-                        embedding=row["vemb"],
-                    )
+            fetched = cur.fetchall()
+        return [
+            StoredRow(
+                pos=int(row["pos"]),
+                chunk=Chunk(
+                    id=row["id"],
+                    doc_id=row["doc_id"],
+                    source=row["source"],
+                    ordinal=int(row["ordinal"]),
+                    text=row["text"],
+                    metadata=json.loads(row["metadata"]),
+                ),
+                term_frequencies=decode_term_frequencies(row["tf"]),
+                embedding=row["vemb"],
+            )
+            for row in fetched
+        ]
 
     def get_chunk_by_id(self, chunk_id: str) -> Chunk | None:
-        row = self._conn.execute(
-            "SELECT id, doc_id, source, ordinal, text, metadata FROM chunks WHERE id = ?",
-            (chunk_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, doc_id, source, ordinal, text, metadata FROM chunks WHERE id = ?",
+                (chunk_id,),
+            ).fetchone()
         if row is None:
             return None
         return Chunk(
@@ -464,6 +477,14 @@ class Store:
         # raising, because a stale id should degrade gracefully.
         return [by_id[cid] for cid in chunk_ids if cid in by_id]
 
+    def _clear_index_rows(self, *, keep_documents: bool = False) -> None:
+        """Delete vectors and chunks. Assumes a transaction is already open."""
+        self._conn.execute("DELETE FROM vectors")
+        self._conn.execute("DELETE FROM chunks")
+        if not keep_documents:
+            self._conn.execute("DELETE FROM documents")
+        self._bump("structure_revision")
+
     def clear_index(self, *, keep_documents: bool = False) -> None:
         """Delete all vectors and chunks, optionally the documents too.
 
@@ -471,14 +492,11 @@ class Store:
         because the documents are the raw material for the new chunks.
         """
         with self.transaction():
-            self._conn.execute("DELETE FROM vectors")
-            self._conn.execute("DELETE FROM chunks")
-            if not keep_documents:
-                self._conn.execute("DELETE FROM documents")
-            self._bump("structure_revision")
+            self._clear_index_rows(keep_documents=keep_documents)
 
     def get_document_ids(self) -> list[str]:
-        rows = self._conn.execute("SELECT id FROM documents ORDER BY added_at").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT id FROM documents ORDER BY added_at").fetchall()
         return [str(r["id"]) for r in rows]
 
     # -- sessions -----------------------------------------------------------
@@ -511,7 +529,8 @@ class Store:
 
     def load_messages(self, session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
         query = "SELECT role, content, payload, created_at FROM messages WHERE session_id = ? ORDER BY seq"
-        rows = self._conn.execute(query, (session_id,)).fetchall()
+        with self._lock:
+            rows = self._conn.execute(query, (session_id,)).fetchall()
         if limit is not None and limit >= 0:
             rows = rows[-limit:] if limit else []
         return [
@@ -521,21 +540,21 @@ class Store:
         ]
 
     def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
+        with self._lock:
+            rows = self._conn.execute(
             "SELECT s.id, s.title, s.created_at, s.updated_at, "
             "       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count "
-            "FROM sessions s ORDER BY s.updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+                "FROM sessions s ORDER BY s.updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # -- stats --------------------------------------------------------------
     def stats(self) -> CorpusStats:
-        documents = int(self._conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"])
-        chunks = self.chunk_count()
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n, MAX(dim) AS d FROM vectors"
-        ).fetchone()
+        with self._lock:
+            documents = int(self._conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"])
+            chunks = int(self._conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"])
+            row = self._conn.execute("SELECT COUNT(*) AS n, MAX(dim) AS d FROM vectors").fetchone()
         return CorpusStats(
             documents=documents,
             chunks=chunks,

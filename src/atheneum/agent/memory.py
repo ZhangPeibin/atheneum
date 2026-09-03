@@ -161,7 +161,9 @@ def compact(
         # is accepting that older findings disappear.
         return tail
 
-    summary = summarize_messages(dropped, max(1, token_budget - used))
+    # The digest only earns its place if it actually fits in what is left; adding
+    # one that overflows would defeat the whole point of having a budget.
+    summary = summarize_messages(dropped, max(0, token_budget - used))
     return [summary, *tail] if summary is not None else tail
 
 
@@ -201,7 +203,11 @@ def summarize_messages(dropped: Sequence[Message], token_budget: int) -> Message
         return None
 
     head = "Summary of earlier conversation:\n"
-    remaining = max(1, token_budget - estimate_tokens(head))
+    remaining = token_budget - estimate_tokens(head)
+    if remaining < 1:
+        # Not even the header fits. Emitting it anyway would break the function's
+        # contract that the digest stays inside the budget it was given.
+        return None
 
     # Spend the budget highest-value-first, preferring the most recent line
     # within a class, but emit chronologically so the digest reads as history.
@@ -212,13 +218,14 @@ def summarize_messages(dropped: Sequence[Message], token_budget: int) -> Message
             chosen.append((position, line))
             remaining -= cost
             continue
-        if not chosen:
-            # Nothing fits at all: truncate the single most valuable line rather
-            # than returning no digest, which would discard the whole history.
-            room = max(1, remaining * 4)
-            chosen.append((position, line[:room].rsplit(" ", 1)[0] + "…"))
-        # Otherwise skip it. A lower-value line that fits is worth more here than
-        # a higher-value line reduced to fragments.
+        # This line does not fit. Truncate it and stop: admitting a lower-value
+        # line after refusing a higher-value one inverts the priority order, which
+        # is how a retrieved finding got dropped while chatter was kept.
+        room = max(1, remaining * 4)
+        truncated = line[:room].rsplit(" ", 1)[0] + "…"
+        if estimate_tokens(f"- {truncated}") <= remaining or not chosen:
+            chosen.append((position, truncated))
+        break
 
     if not chosen:
         return None

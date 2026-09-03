@@ -28,8 +28,41 @@ def test_merged_ignores_none_so_unset_flags_do_not_override():
 
 
 def test_merged_keeps_falsey_but_present_values():
-    config = Config(top_k=5)
-    assert config.merged(top_k=0).top_k == 0
+    # chunk_overlap=0 is meaningful (disable overlap); top_k=0 is not, and is now
+    # rejected by Config validation rather than silently returning no results.
+    config = Config(chunk_overlap=200)
+    assert config.merged(chunk_overlap=0).chunk_overlap == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"top_k": 0},
+        {"top_k": -3},
+        {"fusion_k": 0},
+        {"chunk_size": 0},
+        {"chunk_overlap": -1},
+        {"chunk_overlap": 5000, "chunk_size": 500},
+        {"max_turns": -5},
+        {"token_budget": -1},
+        {"embedder_dim": 0},
+    ],
+)
+def test_invalid_settings_are_rejected_at_construction(kwargs: dict):
+    """These used to be accepted silently and failed later, or returned nothing."""
+    with pytest.raises(ValueError, match="invalid configuration"):
+        Config(**kwargs)
+
+
+def test_valid_boundary_settings_are_accepted():
+    config = Config(top_k=1, chunk_size=100, chunk_overlap=99, max_turns=1, token_budget=1)
+    assert config.chunk_overlap < config.chunk_size
+
+
+def test_bad_env_var_names_its_source(monkeypatch):
+    monkeypatch.setenv("ATHENEUM_TOP_K", "0")
+    with pytest.raises(ValueError, match="environment variables"):
+        load_config(path="/nonexistent.json")
 
 
 def test_merged_routes_unknown_keys_to_extra():

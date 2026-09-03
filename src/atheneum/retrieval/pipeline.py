@@ -390,19 +390,35 @@ class Corpus:
         # chunks. Clearing them first meant that any failure part-way through
         # re-embedding destroyed data permanently -- a two-document corpus came
         # back with one document and zero chunks after a failed rebuild.
-        self.store.clear_index(keep_documents=True)
-        self.invalidate()
-        self._rows = []
         # Re-chunk the documents that are still stored. Going through
         # add_documents would skip every one of them as "already indexed" and
         # leave the corpus with documents but no chunks.
+        prepared: list[tuple[list[Chunk], list[dict[str, int]], list[list[float]]]] = []
         for document in documents:
             chunks = split_document(document, self.config.splitter)
             if not chunks:
                 continue
-            frequencies = [token_frequencies(tokenize(c.text)) for c in chunks]
-            embeddings = self._embed([c.text for c in chunks])
-            self.store.put_chunks(chunks, frequencies, embeddings)
+            prepared.append(
+                (
+                    chunks,
+                    [token_frequencies(tokenize(c.text)) for c in chunks],
+                    self._embed([c.text for c in chunks]),
+                )
+            )
+
+        # All embedding work is finished before anything is deleted, and the wipe
+        # and the re-insert then commit as one transaction. An embedder failure
+        # part-way through used to leave the corpus cleared with a handful of
+        # orphan documents at zero chunks and no way to tell it had happened.
+        # Holding every embedding in memory is the price; rebuild is an explicit
+        # maintenance command over a corpus that already fits in `_rows`.
+        with self.store.transaction():
+            self.store._clear_index_rows(keep_documents=True)
+            for chunks, frequencies, embeddings in prepared:
+                self.store._put_chunk_rows(chunks, frequencies, embeddings)
+
+        self.invalidate()
+        self._rows = []
         self._ensure_ready()
         return self.stats()
 

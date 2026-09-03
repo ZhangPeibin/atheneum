@@ -600,3 +600,192 @@ def test_get_chunks_by_id_survives_a_huge_id_list(tmp_path):
     store.put_chunks(chunks, [{} for _ in chunks])
     assert len(store.get_chunks_by_id([chunks[0].id] * 40_000)) == 40_000
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 5 — store locking, rebuild atomicity, digest budget, config validation
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+import time  # noqa: E402
+
+from atheneum.agent.memory import compact, estimate_tokens, summarize_messages  # noqa: E402
+from atheneum.config import Config  # noqa: E402
+from atheneum.index.store import Store  # noqa: E402
+
+
+def test_an_uncommitted_row_is_not_visible_to_another_thread(tmp_path):
+    """MAJOR: reads ran with no lock, inside another thread's open transaction."""
+    store = Store(tmp_path / "lock.db")
+    secret = Document(source="secret.md", content="UNCOMMITTED-SECRET")
+    observed: list[bool] = []
+
+    def writer() -> None:
+        try:
+            with store.transaction():
+                store._put_document_row(secret)
+                time.sleep(0.4)
+                raise RuntimeError("rollback")
+        except RuntimeError:
+            pass
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    time.sleep(0.15)
+    observed.append(store.get_document(secret.id) is not None)
+    thread.join()
+
+    assert observed == [False], "a reader saw a row that was later rolled back"
+    assert store.get_document(secret.id) is None
+    store.close()
+
+
+def test_a_failed_rebuild_leaves_the_index_untouched(tmp_path):
+    """MAJOR: the wipe committed before re-embedding, so a failure left orphans."""
+    db = str(tmp_path / "atomic.db")
+    corpus = Corpus.open(db)
+    for i in (1, 2, 3):
+        corpus.add_text(f"doc{i}.txt", f"content for document {i} here")
+    before = sorted((r["source"], r["chunk_count"]) for r in corpus.sources())
+
+    class Flaky:
+        name = "flaky"
+        dim = 8
+        calls = 0
+
+        def embed(self, text: str) -> np.ndarray:
+            return np.zeros(8, dtype=np.float32)
+
+        def embed_many(self, texts) -> np.ndarray:
+            type(self).calls += 1
+            if type(self).calls >= 2:
+                raise RuntimeError("BOOM")
+            return np.zeros((len(texts), 8), dtype=np.float32)
+
+    corpus.embedder = Flaky()
+    with pytest.raises(RuntimeError):
+        corpus.rebuild()
+
+    after = sorted((r["source"], r["chunk_count"]) for r in corpus.sources())
+    assert after == before
+    assert corpus.stats()["chunks"] == 3
+    assert not [s for s, n in after if n == 0], "no document may be left with zero chunks"
+    corpus.close()
+
+
+def test_iter_rows_does_not_hold_the_lock_while_iterating(tmp_path):
+    """MINOR: the generator held an RLock across yields, blocking every writer."""
+    from atheneum.text.splitter import split_document
+    from atheneum.text.tokenizer import token_frequencies, tokenize
+
+    store = Store(tmp_path / "iter.db")
+    document = Document(source="a.md", content="hello world content that is long enough to chunk")
+    store.put_document(document)
+    chunks = split_document(document)
+    store.put_chunks(chunks, [token_frequencies(tokenize(c.text)) for c in chunks])
+    rows = store.iter_rows()
+    assert isinstance(rows, list)
+
+    outcome: list[str] = []
+
+    def writer() -> None:
+        try:
+            store.set_meta("key", "value")
+            outcome.append("ok")
+        except Exception as exc:
+            outcome.append(type(exc).__name__)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    thread.join(timeout=5)
+    assert outcome == ["ok"], f"a writer was blocked or failed: {outcome}"
+    assert rows
+    store.close()
+
+
+@pytest.mark.parametrize("budget", [1, 4, 8])
+def test_digest_is_omitted_when_the_header_alone_cannot_fit(budget: int):
+    """MINOR: the digest used to exceed the budget it was handed."""
+    messages = [Message.user("fact " + "x" * 40)]
+    assert summarize_messages(messages, budget) is None
+
+
+def test_digest_stays_within_a_budget_it_can_meet():
+    messages = [Message.user("fact " + "x" * 40)]
+    digest = summarize_messages(messages, 40)
+    assert digest is not None
+    assert estimate_tokens(digest.content) <= 40
+
+
+def test_compact_does_not_add_a_digest_that_overflows_the_remainder():
+    messages = [Message.user("y" * 4000), Message.user("final question")]
+    result = compact(messages, 60)
+    assert result[-1].content == "final question"
+    oversized = [
+        m for m in result if m.role.value == "system" and estimate_tokens(m.content) > 60
+    ]
+    assert not oversized
+
+
+def test_a_retrieved_finding_survives_a_tight_budget():
+    finding = Message.tool(
+        ToolResult(call_id="c", name="search", content="CRITICAL-FINDING " + "z" * 400)
+    )
+    prose = [Message.user(f"chatter {i} " + "q" * 30) for i in range(3)]
+    digest = summarize_messages([*prose, finding], 30)
+    assert digest is not None
+    assert "CRITICAL-FINDING" in digest.content
+    assert estimate_tokens(digest.content) <= 30
+
+
+def test_config_rejects_settings_that_cannot_work():
+    for kwargs in (
+        {"top_k": 0},
+        {"fusion_k": 0},
+        {"chunk_overlap": 5000, "chunk_size": 500},
+        {"max_turns": -5},
+        {"token_budget": -1},
+        {"embedder_dim": 0},
+    ):
+        with pytest.raises(ValueError, match="invalid configuration"):
+            Config(**kwargs)
+
+
+def test_store_reads_are_serialized_with_writes(tmp_path):
+    """Every read path must take the lock; this exercises the main ones at once."""
+    from atheneum.text.splitter import split_document
+    from atheneum.text.tokenizer import token_frequencies, tokenize
+
+    store = Store(tmp_path / "reads.db")
+    document = Document(source="a.md", content="hello world content that is long enough to chunk")
+    store.put_document(document)
+    chunks = split_document(document)
+    store.put_chunks(chunks, [token_frequencies(tokenize(c.text)) for c in chunks])
+    errors: list[str] = []
+
+    def reader() -> None:
+        try:
+            for _ in range(30):
+                store.get_document(document.id)
+                store.list_documents()
+                store.stats()
+                store.chunk_count()
+                store.find_document_by_source("a.md")
+                store.get_document_ids()
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    def writer() -> None:
+        try:
+            for i in range(30):
+                store.set_meta(f"k{i}", str(i))
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=reader) for _ in range(3)] + [threading.Thread(target=writer)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    assert not errors, errors
+    store.close()
