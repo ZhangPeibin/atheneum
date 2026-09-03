@@ -8,6 +8,7 @@ Fusion is the default here.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -111,8 +112,7 @@ class RRFFusion:
                     # longer summed to the whole.
                     continue
                 seen_in_list.add(key)
-                share = weight / (self.k + rank)
-                totals[key] += share
+                share = weight * self.k / (self.k + rank)
                 contributions[key][list_name] = share
                 candidate = (weight, list_name)
                 if key not in provenance or candidate > provenance[key]:
@@ -127,13 +127,19 @@ class RRFFusion:
         # Contributions are scaled by the same factor so that they sum to the
         # reported score. Leaving them raw made `--explain` output incoherent:
         # the parts summed to score/k, not to the score.
+        # fsum over the same scaled parts that are reported, so the contributions
+        # add up to the score exactly. Summing the raw shares and scaling
+        # afterwards differed in the last ulp: 4221 of 20000 random fusions had
+        # sum(contributions) != score, and the score could read 1.0000000000000002
+        # for an item that was top of every list.
+        totals = {key: math.fsum(parts.values()) for key, parts in contributions.items()}
         ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
         return [
             RankedItem(
                 key=key,
                 value=values[key],
-                score=total * self.k,
-                contributions={name: share * self.k for name, share in contributions[key].items()},
+                score=total,
+                contributions=dict(contributions[key]),
             )
             for key, total in ordered
         ]
@@ -166,6 +172,7 @@ class DBSFFusion:
         totals: dict[str, float] = defaultdict(float)
         contributions: dict[str, dict[str, float]] = defaultdict(dict)
         values: dict[str, T] = {}
+        provenance: dict[str, tuple[float, str]] = {}
 
         for list_name, weight in zip(names, resolved, strict=True):
             items = ranked_lists[list_name]
@@ -175,10 +182,14 @@ class DBSFFusion:
                     f"list {list_name!r} has {len(items)} items but {len(raw)} scores"
                 )
             rescaled = _min_max(raw)
+            seen_in_list: set[str] = set()
             for (key, value), scaled in zip(items, rescaled, strict=True):
+                if key in seen_in_list:
+                    continue
+                seen_in_list.add(key)
                 totals[key] += weight * scaled
                 contributions[key][list_name] = weight * scaled
-                values.setdefault(key, value)
+                _record_provenance(provenance, values, key, value, weight, list_name)
 
         ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
         return [
@@ -213,6 +224,7 @@ class WeightedSumFusion:
         totals: dict[str, float] = defaultdict(float)
         contributions: dict[str, dict[str, float]] = defaultdict(dict)
         values: dict[str, T] = {}
+        provenance: dict[str, tuple[float, str]] = {}
 
         for list_name, weight in zip(names, resolved, strict=True):
             items = ranked_lists[list_name]
@@ -221,16 +233,42 @@ class WeightedSumFusion:
                 raise ValueError(
                     f"list {list_name!r} has {len(items)} items but {len(raw)} scores"
                 )
+            seen_in_list: set[str] = set()
             for (key, value), score in zip(items, raw, strict=True):
+                # A key repeated within one list must not be counted twice: it
+                # inflated the total while contributions kept one entry, so the
+                # parts no longer summed to the score.
+                if key in seen_in_list:
+                    continue
+                seen_in_list.add(key)
                 totals[key] += weight * score
                 contributions[key][list_name] = weight * score
-                values.setdefault(key, value)
+                _record_provenance(provenance, values, key, value, weight, list_name)
 
         ordered = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
         return [
             RankedItem(key=key, value=values[key], score=total, contributions=dict(contributions[key]))
             for key, total in ordered
         ]
+
+
+def _record_provenance(
+    provenance: dict[str, tuple[float, str]],
+    values: dict[str, T],
+    key: str,
+    value: T,
+    weight: float,
+    list_name: str,
+) -> None:
+    """Keep the payload from the highest-weighted list, deterministically.
+
+    `values.setdefault` made the surviving payload depend on the order the caller
+    built the dict in, so the same fusion could return either list's value.
+    """
+    candidate = (weight, list_name)
+    if key not in provenance or candidate > provenance[key]:
+        provenance[key] = candidate
+        values[key] = value
 
 
 def _min_max(values: Sequence[float]) -> list[float]:

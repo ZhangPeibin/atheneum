@@ -260,8 +260,54 @@ class ToolRegistry:
         wanted = set(allowed)
         return ToolRegistry(t for name, t in self._tools.items() if name in wanted)
 
-    def execute(self, call: ToolCall, *, result_limit: int = 20_000) -> ToolResult:
-        """Run one tool call, converting every failure into an error result."""
+    def execute(
+        self, call: ToolCall, *, result_limit: int = 20_000, timeout: float | None = None
+    ) -> ToolResult:
+        """Run one tool call, converting every failure into an error result.
+
+        ``timeout`` is opt-in. Without it a tool that blocks on the network or a
+        lock stalls the whole agent run forever, and nothing in the loop bounds
+        that -- max_turns bounds iterations, not the duration of one. Note that a
+        timed-out tool is *reported* as failed but its thread cannot be killed, so
+        the work may still be running in the background.
+        """
+        if timeout is not None and timeout > 0:
+            return self._execute_with_timeout(call, result_limit=result_limit, timeout=timeout)
+        return self._execute(call, result_limit=result_limit)
+
+    def _execute_with_timeout(self, call: ToolCall, *, result_limit: int, timeout: float) -> ToolResult:
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        # Not `with`: the executor's __exit__ calls shutdown(wait=True), which
+        # blocks until the runaway tool finishes and makes the timeout report
+        # correctly while still stalling the run for the full duration.
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{call.name}")
+        try:
+            future = pool.submit(self._execute, call, result_limit=result_limit)
+            try:
+                return future.result(timeout=timeout)
+            except FuturesTimeout:
+                future.cancel()
+                logger.warning("tool %s exceeded %.1fs", call.name, timeout)
+                return ToolResult(
+                    call_id=call.id,
+                    name=call.name,
+                    content=json.dumps(
+                        {
+                            "error": "timeout",
+                            "message": f"{call.name} did not return within {timeout}s",
+                            "hint": "narrow the request or use a different tool",
+                        }
+                    ),
+                    is_error=True,
+                )
+        finally:
+            # wait=False: the thread cannot be killed, so the tool may keep
+            # running. The agent is released, which is the point.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _execute(self, call: ToolCall, *, result_limit: int) -> ToolResult:
         definition = self._tools.get(call.name)
         if definition is None:
             available = ", ".join(self.names()) or "none"

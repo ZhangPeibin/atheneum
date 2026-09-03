@@ -238,6 +238,20 @@ class Store:
     def structure_revision(self) -> int:
         return int(self._get_meta("structure_revision") or 0)
 
+    def revisions(self) -> tuple[int, int]:
+        """Both counters read as one snapshot: (structure, append).
+
+        Reading them separately is not safe: a delete plus an append committing
+        between the two queries looks like "appended only", which sends an
+        incremental loader down the wrong path.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM meta WHERE key IN ('structure_revision', 'append_revision')"
+            ).fetchall()
+        values = {row["key"]: int(row["value"]) for row in rows}
+        return values.get("structure_revision", 0), values.get("append_revision", 0)
+
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction():
             self._set_meta(key, value)

@@ -61,6 +61,10 @@ class AgentConfig:
     # capped at the registry boundary rather than trusting tools to be brief.
     result_limit: int = 20_000
     temperature: float = 0.0
+    # None means no limit. A tool that blocks on a network call otherwise stalls
+    # the run indefinitely: max_turns bounds the number of iterations, not the
+    # duration of any one of them.
+    tool_timeout: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_turns <= 0:
@@ -191,12 +195,23 @@ class Agent:
 
             if not generation.tool_calls:
                 steps.append(Step(turn=turn, generation=generation))
+                # A provider can report that the turn did not really complete --
+                # Anthropic's pause_turn ("call me again to continue") and refusal
+                # both map to finish_reason="error". Treating that as a final
+                # answer presented a non-answer as a result and reported ok=True.
+                errored = generation.finish_reason == "error"
                 return AgentRun(
                     answer=resolve_final_answer(generation, steps),
                     messages=tuple(memory.messages),
                     steps=tuple(steps),
                     usage=usage,
-                    stopped_reason="final_answer",
+                    stopped_reason="provider_error" if errored else "final_answer",
+                    error=(
+                        f"provider ended the turn with finish_reason=error "
+                        f"(raw stop_reason: {generation.raw.get('stop_reason')})"
+                        if errored
+                        else None
+                    ),
                 )
 
             if not self.tools:
@@ -290,6 +305,7 @@ class Agent:
 
             if not calls:
                 steps.append(Step(turn=turn, generation=generation))
+                errored = generation.finish_reason == "error"
                 yield AgentEvent(
                     kind="done",
                     turn=turn,
@@ -298,7 +314,8 @@ class Agent:
                         messages=tuple(memory.messages),
                         steps=tuple(steps),
                         usage=usage,
-                        stopped_reason="final_answer",
+                        stopped_reason="provider_error" if errored else "final_answer",
+                        error="provider ended the turn with finish_reason=error" if errored else None,
                     ),
                 )
                 return
@@ -351,7 +368,15 @@ class Agent:
 
     def _execute_calls(self, calls: Sequence[ToolCall], memory: ConversationMemory, turn: int) -> list[ToolResult]:
         results: list[ToolResult] = []
+        seen_ids: set[str] = set()
         for call in calls:
+            if call.id in seen_ids:
+                # Executing it twice is wrong on its own, and emitting two
+                # tool_result blocks with the same tool_use_id is an HTTP 400 on
+                # Anthropic.
+                logger.warning("turn %d: provider repeated tool call id %s; ignoring", turn, call.id)
+                continue
+            seen_ids.add(call.id)
             definition = self.tools.get(call.name)
             if definition is not None and definition.requires_approval and (
                 self.confirm is None or not self._approved(call, definition)
@@ -369,7 +394,9 @@ class Agent:
                     memory.add(Message.tool(declined))
                     results.append(declined)
                     continue
-            result = self.tools.execute(call, result_limit=self.config.result_limit)
+            result = self.tools.execute(
+                call, result_limit=self.config.result_limit, timeout=self.config.tool_timeout
+            )
             memory.add(Message.tool(result))
             logger.debug("turn %d: %s -> error=%s", turn, call.name, result.is_error)
             results.append(result)

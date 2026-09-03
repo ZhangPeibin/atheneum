@@ -86,7 +86,10 @@ def tokenize(text: str, *, remove_stopwords: bool = True) -> list[str]:
             return
         chars = list(cjk_run)
         cjk_run.clear()
-        tokens.extend(chars)
+        # Single Han characters are dropped when they are function words: 的/了/是
+        # carry no retrieval signal and inflate the index. Bigrams are always kept,
+        # because a two-character unit is where the meaning actually lives.
+        tokens.extend(c for c in chars if not (remove_stopwords and c in CJK_STOPWORDS))
         for first, second in itertools.pairwise(chars):
             tokens.append(first + second)
 

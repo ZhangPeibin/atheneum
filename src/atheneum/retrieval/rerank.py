@@ -40,6 +40,10 @@ class LexicalOverlapReranker:
     density_weight: float = 1.0
 
     def rerank(self, query: str, documents: Sequence[tuple[str, str]], top_k: int) -> list[tuple[str, float]]:
+        if top_k <= 0:
+            # A negative top_k sliced from the END of the list, returning results
+            # for "give me none".
+            return []
         query_terms = set(tokenize(query))
         if not query_terms:
             return [(key, 0.0) for key, _ in documents[:top_k]]
@@ -93,7 +97,7 @@ class CrossEncoderReranker:
         return self._model
 
     def rerank(self, query: str, documents: Sequence[tuple[str, str]], top_k: int) -> list[tuple[str, float]]:
-        if not documents:
+        if not documents or top_k <= 0:
             return []
         model = self._ensure_model()
         pairs = [(query, text) for _, text in documents]

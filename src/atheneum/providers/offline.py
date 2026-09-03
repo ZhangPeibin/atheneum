@@ -89,10 +89,10 @@ class OfflineProvider(Provider):
     # -- provider interface -------------------------------------------------
     def complete(self, request: GenerationRequest) -> Generation:
         query = request.last_user_message()
-        evidence = parse_evidence(request.tool_results())
+        evidence = parse_evidence(request.tool_results(), accepted=(self.search_tool, *EVIDENCE_TOOLS))
 
         if not evidence:
-            if self.search_tool in request.tools and not _already_searched(request):
+            if self.search_tool in request.tools and not _already_searched(request, self.search_tool):
                 # Ask for retrieval first. This makes the offline path a genuine
                 # two-turn agent run rather than a single-shot lookup.
                 return Generation(
@@ -185,15 +185,22 @@ class _Sentence:
     position: int
 
 
-def parse_evidence(messages: Sequence[Message]) -> list[Evidence]:
+def parse_evidence(
+    messages: Sequence[Message], accepted: Sequence[str] = EVIDENCE_TOOLS
+) -> list[Evidence]:
     """Read retrieved passages out of tool result messages.
 
-    Accepts the JSON emitted by the built-in search tool and ignores anything
-    else, so an unrelated tool result never masquerades as evidence.
+    Accepts the JSON emitted by a recognised search tool and ignores anything
+    else, so an unrelated tool result never masquerades as evidence. ``accepted``
+    is a parameter because OfflineProvider.search_tool is configurable: hardcoding
+    the built-in names meant a renamed search tool produced evidence the provider
+    refused to read, and it then asked for the same tool every turn until
+    max_turns ran out.
     """
+    allowed = set(accepted)
     collected: list[Evidence] = []
     for message in messages:
-        if message.name and message.name not in EVIDENCE_TOOLS:
+        if message.name and message.name not in allowed:
             continue
         payload = _load_json(message.content)
         if payload is None:
@@ -300,21 +307,18 @@ def _dedupe(sentences: Sequence[_Sentence]) -> list[_Sentence]:
     return kept
 
 
-def _already_searched(request: GenerationRequest) -> bool:
+def _already_searched(request: GenerationRequest, search_tool: str) -> bool:
     """Stop the loop when retrieval has already run and returned nothing.
 
     Without this the provider would keep emitting the same search call and the
     agent would burn every turn on it.
     """
+    recognised = {search_tool, *EVIDENCE_TOOLS}
     for message in request.messages:
         for call in message.tool_calls:
-            if call.name == request_search_tool(request) or call.name in EVIDENCE_TOOLS:
+            if call.name in recognised:
                 return True
-    return any(message.name in EVIDENCE_TOOLS for message in request.messages)
-
-
-def request_search_tool(request: GenerationRequest) -> str:
-    return "search"
+    return any(message.name in recognised for message in request.messages)
 
 
 def _echo_answer(query: str, request: GenerationRequest) -> str:

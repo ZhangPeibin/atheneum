@@ -223,7 +223,9 @@ def summarize_messages(dropped: Sequence[Message], token_budget: int) -> Message
         # is how a retrieved finding got dropped while chatter was kept.
         room = max(1, remaining * 4)
         truncated = line[:room].rsplit(" ", 1)[0] + "…"
-        if estimate_tokens(f"- {truncated}") <= remaining or not chosen:
+        # No "or not chosen" escape: it admitted a first line that overflowed the
+        # budget, so summarize_messages could hand back more than it was given.
+        if estimate_tokens(f"- {truncated}") <= remaining:
             chosen.append((position, truncated))
         break
 

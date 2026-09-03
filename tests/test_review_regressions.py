@@ -613,6 +613,7 @@ def test_get_chunks_by_id_survives_a_huge_id_list(tmp_path):
 import threading  # noqa: E402
 import time  # noqa: E402
 
+from atheneum.agent.builtin_tools import build_corpus_tools  # noqa: E402
 from atheneum.agent.memory import compact, estimate_tokens, summarize_messages  # noqa: E402
 from atheneum.config import Config  # noqa: E402
 from atheneum.index.store import Store  # noqa: E402
@@ -999,7 +1000,9 @@ from atheneum.config import Config as _Config  # noqa: E402
 
 
 def _client(tmp_path, name: str) -> TestClient:
-    return TestClient(create_app(_Config(db=str(tmp_path / name))))
+    from pathlib import Path as _P
+
+    return TestClient(create_app(_Config(db=str(_P(tmp_path) / name))))
 
 
 @pytest.mark.parametrize("source", ["trail\n", " pad ", "lead\nline", "tab\tsep"])
@@ -1053,5 +1056,273 @@ def test_a_whitespace_only_token_does_not_fake_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("ATHENEUM_API_TOKEN", "   ")
     client = _client(tmp_path, "blank.db")
     with client:
-        assert client.get("/health").json()["auth"] is False
+        # /health no longer advertises the auth mode at all, so an anonymous
+        # caller cannot learn whether a token is configured.
+        assert "auth" not in client.get("/health").json()
         assert client.get("/stats").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Round 8 — final-review findings: embedders, tools, providers, fusion, text
+# ---------------------------------------------------------------------------
+
+
+from atheneum.retrieval.embedders import (  # noqa: E402
+    OllamaEmbedder,
+    OpenAIEmbedder,
+    _ordered_embeddings,
+)
+from atheneum.retrieval.rerank import LexicalOverlapReranker  # noqa: E402
+
+
+def test_embeddings_are_reinserted_in_input_order_not_lexicographic():
+    """BLOCKER: sorting on the raw index field ordered "10" before "2"."""
+    items = [
+        {"index": "3", "embedding": [3.0]},
+        {"index": "0", "embedding": [0.0]},
+        {"index": "2", "embedding": [2.0]},
+        {"index": "1", "embedding": [1.0]},
+    ]
+    rows = _ordered_embeddings(items, ["a", "b", "c", "d"])
+    assert [r[0] for r in rows] == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_a_missing_index_falls_back_to_position_not_zero():
+    """Defaulting to 0 shifted every later row into the wrong slot."""
+    items = [{"embedding": [99.0]}, {"embedding": [1.0]}]
+    rows = _ordered_embeddings(items, ["a", "b"])
+    assert [r[0] for r in rows] == [99.0, 1.0]
+
+
+def test_an_ambiguous_index_raises_instead_of_picking_an_order():
+    """A defaulted index that collides with an explicit one cannot be guessed."""
+    items = [{"index": 1, "embedding": [1.0]}, {"embedding": [99.0]}]
+    with pytest.raises(RuntimeError, match="index 1 twice"):
+        _ordered_embeddings(items, ["a", "b"])
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [{"index": 0, "embedding": [1.0]}, {"index": 0, "embedding": [2.0]}],  # duplicate
+        [{"index": 5, "embedding": [1.0]}],  # out of range
+        [{"index": 0}],  # missing embedding key
+        "notalist",  # wrong container
+    ],
+)
+def test_malformed_embedding_payloads_raise_instead_of_misaligning(items: object):
+    with pytest.raises(RuntimeError):
+        _ordered_embeddings(items, ["a", "b"])
+
+
+def test_network_embedders_keep_their_own_names():
+    """MAJOR: a dataclass field named `name` clobbered the subclass attribute.
+
+    Both reported name="http", so describe() could not distinguish backends and
+    the index/embedder mismatch guard was defeated.
+    """
+    assert OpenAIEmbedder().name == "openai"
+    assert OllamaEmbedder().name == "ollama"
+
+
+def test_an_api_key_never_appears_in_a_repr():
+    embedder = OpenAIEmbedder(api_key="sk-SECRET-VALUE-123")
+    assert "sk-SECRET-VALUE-123" not in repr(embedder)
+
+
+def test_a_timed_out_tool_releases_the_agent():
+    """MAJOR: with-block shutdown(wait=True) made the timeout report but not help."""
+
+    def sleeper() -> str:
+        """Blocks for two seconds."""
+        time.sleep(2.0)
+        return "never"
+
+    started = time.perf_counter()
+    result = ToolRegistry([tool(sleeper)]).execute(
+        ToolCall(id="c", name="sleeper", arguments={}), timeout=0.3
+    )
+    elapsed = time.perf_counter() - started
+    assert result.is_error
+    assert "timeout" in result.content
+    assert elapsed < 1.0, f"a 0.3s timeout waited {elapsed:.2f}s"
+
+
+def test_a_hanging_tool_stalls_the_whole_agent_run_without_a_timeout():
+    from atheneum.agent.loop import Agent, AgentConfig
+    from atheneum.providers.base import Generation, Provider
+
+    class Once(Provider):
+        name = "once"
+
+        def __init__(self, gens: list[Generation]) -> None:
+            self.gens = gens
+            self.i = 0
+
+        def complete(self, request: GenerationRequest) -> Generation:
+            value = self.gens[min(self.i, len(self.gens) - 1)]
+            self.i += 1
+            return value
+
+    def sleeper() -> str:
+        """Blocks briefly."""
+        time.sleep(0.4)
+        return "x"
+
+    gens = [
+        Generation(text="", tool_calls=[ToolCall(id="c", name="sleeper", arguments={})], finish_reason="tool_calls"),
+        Generation(text="done", finish_reason="stop"),
+    ]
+    started = time.perf_counter()
+    run = Agent(Once(gens), ToolRegistry([tool(sleeper)]), config=AgentConfig(max_turns=3, tool_timeout=0.1)).run(
+        "q"
+    )
+    assert time.perf_counter() - started < 0.35
+    assert run.steps[0].results[0].is_error
+    assert run.answer == "done"
+
+
+def test_duplicate_tool_call_ids_are_executed_once():
+    """MINOR: a repeated id ran twice and emitted duplicate tool_use_ids."""
+    calls = [ToolCall(id="dup", name="noop", arguments={}), ToolCall(id="dup", name="noop", arguments={})]
+
+    def noop() -> str:
+        """Does nothing."""
+        return "ok"
+
+    from atheneum.agent.loop import Agent, AgentConfig
+    from atheneum.providers.base import Generation, Provider
+
+    class Once(Provider):
+        name = "once"
+
+        def __init__(self, gens: list[Generation]) -> None:
+            self.gens = gens
+            self.i = 0
+
+        def complete(self, request: GenerationRequest) -> Generation:
+            value = self.gens[min(self.i, len(self.gens) - 1)]
+            self.i += 1
+            return value
+
+    gens = [
+        Generation(text="", tool_calls=calls, finish_reason="tool_calls"),
+        Generation(text="done", finish_reason="stop"),
+    ]
+    run = Agent(Once(gens), ToolRegistry([tool(noop)]), config=AgentConfig(max_turns=3)).run("q")
+    assert len(run.steps[0].results) == 1
+
+
+def test_read_source_requires_an_exact_or_unambiguous_filename():
+    """MAJOR: a substring match served src/ab.py for read_source("b.py")."""
+    corpus = Corpus.in_memory()
+    corpus.add_text("src/ab.py", "ALPHA-DOC-CONTENT")
+    corpus.add_text("src/b.py", "BRAVO-DOC-CONTENT")
+    registry = build_corpus_tools(corpus)
+
+    def call(source: str) -> dict:
+        import json as _json
+
+        return _json.loads(registry.execute(ToolCall(id="c", name="read_source", arguments={"source": source})).content)
+
+    assert call("b.py")["source"] == "src/b.py"
+    assert call("")["error"] == "invalid_arguments"
+    assert call("nope")["error"] == "not_found"
+    assert call("ab")["error"] == "not_found"
+    corpus.add_text("other/b.py", "OTHER-B-DOC")
+    ambiguous = call("b.py")
+    assert ambiguous["error"] == "ambiguous_source"
+    assert len(ambiguous["candidates"]) == 2
+    corpus.close()
+
+
+def test_search_reports_an_invalid_mode_as_a_tool_result():
+    """MINOR: it raised ValueError out of the tool instead of describing the options."""
+    import json as _json
+
+    corpus = Corpus.in_memory()
+    corpus.add_text("a.md", "token bucket rate limiting")
+    registry = build_corpus_tools(corpus)
+    payload = _json.loads(
+        registry.execute(ToolCall(id="c", name="search", arguments={"query": "bucket", "mode": "bogus"})).content
+    )
+    assert payload["error"] == "invalid_arguments"
+    assert "hybrid" in str(payload["message"])
+    corpus.close()
+
+
+def test_weighted_and_distribution_fusions_reject_duplicate_keys_too():
+    """MINOR: only RRF had the fix; these still double-counted a repeated key."""
+    from atheneum.retrieval.fusion import DBSFFusion, WeightedSumFusion
+
+    weighted = WeightedSumFusion().fuse({"a": [("k", "A"), ("k", "A2")]}, scores={"a": [1.0, 3.0]})[0]
+    assert weighted.score == pytest.approx(sum(weighted.contributions.values()))
+
+    distributed = DBSFFusion().fuse(
+        {"a": [("k", "A"), ("k", "A2")], "b": [("k", "B")]}, scores={"a": [1.0, 0.5], "b": [0.9]}
+    )[0]
+    assert distributed.score == pytest.approx(sum(distributed.contributions.values()))
+
+
+def test_heavier_list_wins_the_payload_regardless_of_dict_order():
+    from atheneum.retrieval.fusion import WeightedSumFusion
+
+    first = WeightedSumFusion().fuse(
+        {"a": [("k", "A")], "b": [("k", "B")]}, scores={"a": [1.0], "b": [3.0]}, weights=[0.9, 0.1]
+    )[0]
+    # Weights are positional by design, so the same logical weighting of "a"
+    # means a reordered weight list once the declared order flips.
+    second = WeightedSumFusion().fuse(
+        {"b": [("k", "B")], "a": [("k", "A")]}, scores={"a": [1.0], "b": [3.0]}, weights=[0.1, 0.9]
+    )[0]
+    assert first.value == second.value == "A"
+
+
+def test_rerankers_treat_a_non_positive_top_k_as_no_results():
+    """MINOR: a negative top_k sliced from the end and returned results anyway."""
+    reranker = LexicalOverlapReranker()
+    docs = [("a", "token bucket rate limiting"), ("b", "unrelated prose")]
+    assert reranker.rerank("token bucket", docs, -1) == []
+    assert reranker.rerank("token bucket", docs, 0) == []
+
+
+def test_paragraph_breaks_are_a_real_splitting_level():
+    """The documented cascade claimed paragraphs; PARAGRAPH_SEPARATORS was dead."""
+    from atheneum.text.splitter import _split_paragraphs
+
+    parts = _split_paragraphs("One two three.\n\nFour five six.\n\n\nSeven eight.")
+    assert parts == ["One two three.", "Four five six.", "Seven eight."]
+
+
+def test_chunking_still_loses_nothing_with_paragraph_packing():
+    import collections
+
+    text = ("Para one has content.\n\n" * 30) + ("x" * 3000) + "\n\nTail para."
+    chunks = split_text(text, SplitterConfig(chunk_size=120, chunk_overlap=20))
+    before = collections.Counter(c for c in text if not c.isspace())
+    after = collections.Counter(c for c in "".join(chunks) if not c.isspace())
+    assert all(count <= after.get(char, 0) for char, count in before.items())
+
+
+def test_cjk_stopwords_are_applied_to_unigrams_only():
+    from atheneum.text.tokenizer import tokenize
+
+    tokens = tokenize("我的队列")
+    assert "队列" in tokens
+    assert "的" not in tokens
+    assert "我的" in tokens  # bigrams survive; meaning lives in the pair
+
+
+def test_giant_title_and_metadata_are_rejected():
+    """LOW: only `content` was size-capped; one request grew the db to 34 MB."""
+    client = _client(tmp_path := __import__("tempfile").mkdtemp(), "fields.db")
+    with client:
+        big = "T" * 8_000_000
+        assert client.post("/documents", json={"source": "u.md", "content": "x", "title": big}).status_code == 422
+        assert (
+            client.post(
+                "/documents", json={"source": "u.md", "content": "x", "metadata": {"k": big}}
+            ).status_code
+            == 422
+        )
+        assert client.get("/health").json().get("auth") is None

@@ -167,8 +167,13 @@ class ProviderRegistry:
     def create(self, name: str, **settings: Any) -> Provider:
         """Instantiate the provider registered under ``name``."""
         self._ensure_entry_points()
-        key = (name or "offline").strip().lower()
-        profile = self._profiles.get(key) or self._profiles.get((settings.get("kind") or "").lower())
+        if not isinstance(name, str):
+            raise KeyError(f"provider name must be a string, got {type(name).__name__}")
+        key = name.strip().lower() or "offline"
+        kind_setting = settings.get("kind")
+        profile = self._profiles.get(key) or self._profiles.get(
+            kind_setting.strip().lower() if isinstance(kind_setting, str) else ""
+        )
         if profile is None and key not in self._factories:
             raise KeyError(
                 f"unknown provider {name!r}. Known providers: {', '.join(self.names())}"
@@ -218,7 +223,13 @@ class ProviderRegistry:
             from importlib.metadata import entry_points
         except ImportError:  # pragma: no cover
             return
-        candidates: Any = entry_points(group=ENTRY_POINT_GROUP)
+        try:
+            candidates: Any = list(entry_points(group=ENTRY_POINT_GROUP))
+        except Exception as exc:
+            # The flag is already set, so this is never retried; without the guard
+            # the failure escaped out of names() and create() instead.
+            logger.warning("could not enumerate %s entry points: %s", ENTRY_POINT_GROUP, exc)
+            return
         for candidate in candidates:
             try:
                 loaded = candidate.load()
@@ -230,10 +241,20 @@ class ProviderRegistry:
                 logger.warning("could not load provider plugin %r: %s", candidate.name, exc)
 
     def register_plugin(self, name: str, cls: type) -> None:
-        """Register a Provider subclass exposed by a plugin."""
+        """Register a Provider subclass exposed by a plugin.
+
+        Only a classmethod or staticmethod named ``create`` is accepted as a
+        factory. An ordinary instance method has the same attribute name, and
+        using it produced a factory that failed at call time with "missing
+        required positional argument: self" -- a plugin that registers fine and
+        breaks on first use.
+        """
         module = getattr(cls, "__module__", "")
-        target = getattr(cls, "create", None)
-        factory: Factory = target if callable(target) else cls  # type: ignore[assignment]
+        raw = cls.__dict__.get("create")
+        if isinstance(raw, classmethod | staticmethod):
+            factory: Factory = raw.__func__ if isinstance(raw, classmethod) else raw  # type: ignore[assignment]
+        else:
+            factory = cls  # type: ignore[assignment]
         self._factories[name] = (module or "plugin", factory)
 
 
@@ -281,7 +302,26 @@ def resolve_provider(spec: str | Mapping[str, Any] | Provider | None) -> Provide
         return get_provider(spec)
     data = dict(spec)
     name = str(data.pop("name", None) or data.pop("provider", None) or "offline")
-    return get_provider(name, **data)
+    provider = get_provider(name, **data)
+    known = _accepted_settings(provider)
+    unknown = sorted(set(data) - known)
+    if unknown:
+        # A typo like {"base_url": ...} misspelled used to vanish without a trace,
+        # leaving the caller talking to the wrong endpoint.
+        logger.warning("ignoring unknown provider setting(s) for %r: %s", name, ", ".join(unknown))
+    return provider
+
+
+def _accepted_settings(provider: Provider) -> set[str]:
+    import inspect
+
+    try:
+        signature = inspect.signature(type(provider).__init__)
+    except (TypeError, ValueError):  # pragma: no cover
+        return set()
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values()):
+        return set()
+    return set(signature.parameters)
 
 
 def load_provider_module(module: str) -> Any:  # pragma: no cover - plugin helper

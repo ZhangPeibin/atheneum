@@ -156,6 +156,17 @@ def _split_sections(text: str, cfg: SplitterConfig) -> Iterator[str]:
             yield from _split_on_headings(remainder)
 
 
+def _split_paragraphs(text: str) -> list[str]:
+    """Split on blank lines, longest separator first."""
+    parts = [text]
+    for separator in PARAGRAPH_SEPARATORS:
+        nxt: list[str] = []
+        for part in parts:
+            nxt.extend(p for p in part.split(separator) if p.strip())
+        parts = nxt or parts
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _is_whole_code_block(section: str) -> bool:
     """True when the section is a complete fenced block."""
     if section.count("```") < 2:
@@ -189,7 +200,17 @@ def _pack(section: str, cfg: SplitterConfig) -> list[str]:
     if len(section) <= cfg.chunk_size:
         return [section]
 
-    sentences = _split_sentences(section)
+    # Paragraphs first: a blank-line break is a stronger boundary than a full
+    # stop, so packing respects it before falling back to sentences. This is the
+    # level the documented cascade claims, and PARAGRAPH_SEPARATORS existed for it
+    # without ever being used.
+    units: list[str] = []
+    for paragraph in _split_paragraphs(section):
+        if len(paragraph) <= cfg.chunk_size:
+            units.append(paragraph)
+        else:
+            units.extend(_split_sentences(paragraph))
+    sentences = units or _split_sentences(section)
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0

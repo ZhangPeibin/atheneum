@@ -118,7 +118,16 @@ class OpenAICompatibleProvider(Provider):
                         status=status,
                         retryable=False,
                     )
-                return response.json()
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    # A 200 with a non-JSON body means a proxy or gateway answered
+                    # instead of the model. The raw ValueError missed the loop's
+                    # `except ProviderError` and surfaced as a traceback.
+                    raise ProviderError(
+                        f"{self._url(path)} returned status {response.status_code} with a "
+                        f"non-JSON body: {response.text[:200]!r}"
+                    ) from exc
             except ProviderError:
                 raise
             except httpx.HTTPError as exc:

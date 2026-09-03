@@ -105,7 +105,16 @@ class AnthropicProvider(Provider):
                         f"anthropic returned {response.status_code}: {response.text[:400]}",
                         status=response.status_code,
                     )
-                return response.json()
+                try:
+                    return response.json()
+                except ValueError as exc:
+                    # A 200 with a non-JSON body means a proxy answered instead of
+                    # the API; the raw ValueError missed the loop's
+                    # `except ProviderError` and surfaced as a traceback.
+                    raise ProviderError(
+                        f"{url} returned status {response.status_code} with a non-JSON "
+                        f"body: {response.text[:200]!r}"
+                    ) from exc
             except ProviderError:
                 raise
             except httpx.HTTPError as exc:
@@ -244,7 +253,13 @@ def _build_messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
         if message.role is Role.TOOL:
             block = _tool_result_block(message)
             last = out[-1] if out else None
-            if last is not None and last["role"] == "user" and _only_tool_results(last["content"]):
+            # Any preceding user message, not only one made entirely of
+            # tool_results: Anthropic permits text and tool_result blocks to share
+            # a user message. Restricting it left [user("hello"), tool, tool]
+            # encoding as two adjacent user messages, which is an HTTP 400 -- and
+            # that sequence is reachable from caller-supplied history or from
+            # memory compaction dropping the assistant tool-call turn.
+            if last is not None and last["role"] == "user":
                 last["content"].append(block)
             else:
                 out.append({"role": "user", "content": [block]})

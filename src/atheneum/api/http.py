@@ -26,6 +26,7 @@ SearchMode = Literal["hybrid", "lexical", "vector"]
 
 _MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
 _MAX_QUERY_CHARS = 8000
+_MAX_FIELD_BYTES = 64 * 1024
 # \Z, not $: in Python `$` also matches immediately before a trailing newline, so
 # a source of "notes.md\n" passed validation and was stored with the newline
 # intact, which is exactly the forged-citation case the validator exists to stop.
@@ -48,6 +49,24 @@ class DocumentIn(BaseModel):
             raise ValueError(
                 f"content is {encoded} bytes, over the {_MAX_DOCUMENT_BYTES} byte limit"
             )
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def _validate_title_size(cls, value: str | None) -> str | None:
+        # The content limit alone let a caller persist an 8 MB title and an 8 MB
+        # metadata value; one request grew the database by 34 MB.
+        if value is not None and len(value.encode("utf-8")) > _MAX_FIELD_BYTES:
+            raise ValueError(f"title must be at most {_MAX_FIELD_BYTES} bytes")
+        return value
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata_size(cls, value: dict[str, Any]) -> dict[str, Any]:
+        import json as _json
+
+        if len(_json.dumps(value, ensure_ascii=False).encode("utf-8")) > _MAX_FIELD_BYTES:
+            raise ValueError(f"metadata must be at most {_MAX_FIELD_BYTES} bytes")
         return value
 
     @field_validator("source")
@@ -184,7 +203,10 @@ def create_app(config: Config | None = None) -> Any:
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "version": atheneum.__version__, "auth": bool(token)}
+        # No auth flag: /health is deliberately unauthenticated, so telling an
+        # anonymous caller whether the deployment has a token set is free
+        # reconnaissance for no operational benefit.
+        return {"status": "ok", "version": atheneum.__version__}
 
     @app.get("/stats", dependencies=[Depends(require_token)])
     def stats() -> dict[str, Any]:
@@ -313,6 +335,20 @@ async def _lifespan(app: Any) -> AsyncIterator[None]:
             context.close()
 
 
-app = None
-if os.environ.get("ATHENEUM_SERVE") == "1":  # pragma: no cover - uvicorn import target
-    app = create_app()
+# Deliberately no module-level `app` object.
+
+# An earlier version had `app = None` here, set only when ATHENEUM_SERVE=1.
+# `ath serve` never set that variable, so uvicorn resolved
+# "atheneum.api.http:app" to None and every route answered 500 with
+# `TypeError: 'NoneType' object is not callable`. The TestClient suite could not
+# catch it because it calls create_app() directly and never goes through the
+# import string -- the exact gap between "the code is correct" and "the command
+# in the README works".
+#
+# Servers should use the factory: uvicorn --factory atheneum.api.http:create_app
+# or, equivalently, `ath serve`.
+
+
+def build_app() -> Any:
+    """Zero-argument ASGI app factory, honouring ATHENEUM_* environment config."""
+    return create_app(load_config())

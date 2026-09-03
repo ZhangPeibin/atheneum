@@ -14,13 +14,14 @@ is identical either way.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import json
 import os
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from typing import Any, Protocol, cast, runtime_checkable
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 
 import numpy as np
 
@@ -38,9 +39,14 @@ __all__ = [
 
 @runtime_checkable
 class Embedder(Protocol):
-    """A backend that turns text into a fixed-width vector."""
+    """A backend that turns text into a fixed-width vector.
 
-    name: str
+    ``name`` is deliberately not a protocol member: implementations expose it as
+    a class attribute, and requiring an instance attribute made every concrete
+    embedder fail the protocol check. Callers read it with getattr, which is what
+    ``describe()`` already does.
+    """
+
     dim: int
 
     def embed(self, text: str) -> np.ndarray: ...
@@ -111,20 +117,28 @@ def _bucket(feature: str, dim: int, salt: bytes = b"") -> int:
 
 @dataclass(slots=True)
 class _HttpEmbedder:
-    """Shared plumbing for embedders that call an HTTP endpoint."""
+    """Shared plumbing for embedders that call an HTTP endpoint.
 
-    name: str = "http"
+    ``name`` is a ClassVar, not a field. As a field it defaulted to "http" and
+    every subclass instance reported that instead of its own name, so
+    ``describe()`` could not tell OpenAI from Ollama -- which silently defeated
+    the index/embedder mismatch guard that depends on it.
+    """
+
     dim: int = 0
-    api_key: str | None = None
+    # repr=False: the generated dataclass repr printed the API key verbatim.
+    api_key: str | None = field(default=None, repr=False)
     timeout: float = 60.0
     max_retries: int = 3
+
+    name: ClassVar[str] = "http"
 
     def _client(self) -> Any:
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - depends on extras
             raise RuntimeError(
-                f"{self.name} needs the network extra; install with "
+                f"{type(self).name} needs the network extra; install with "
                 "`pip install atheneum[net]`"
             ) from exc
         return httpx
@@ -135,23 +149,70 @@ class _HttpEmbedder:
         for attempt in range(self.max_retries):
             try:
                 response = httpx.post(url, headers=headers, json=payload, timeout=self.timeout)
-                if response.status_code == 429 or response.status_code >= 500:
-                    # Transient: back off and retry rather than failing the batch.
-                    last_error = RuntimeError(f"{url} returned {response.status_code}")
-                    _sleep_backoff(attempt)
-                    continue
-                response.raise_for_status()
-                return cast(dict[str, Any], response.json())
             except httpx.HTTPError as exc:
+                # Transport-level only. raise_for_status() used to be inside this
+                # try, and HTTPStatusError subclasses HTTPError, so a permanent
+                # 401 was retried three times with backoff and the real cause was
+                # buried under "failed: status 401".
                 last_error = exc
-                _sleep_backoff(attempt)
-        raise RuntimeError(f"embedding request to {url} failed: {last_error}") from last_error
+                if attempt < self.max_retries - 1:
+                    _sleep_backoff(attempt)
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                last_error = RuntimeError(f"{url} returned {response.status_code}")
+                if attempt < self.max_retries - 1:
+                    _sleep_backoff(attempt, response.headers.get("retry-after"))
+                continue
+            if response.status_code >= 400:
+                # Permanent: fail immediately with the status and body visible.
+                raise RuntimeError(
+                    f"embedding request to {url} failed with status "
+                    f"{response.status_code}: {response.text[:200]}"
+                )
+            return cast(dict[str, Any], response.json())
+        raise RuntimeError(f"embedding request to {url} failed after {self.max_retries} attempts: {last_error}") from last_error
 
 
-def _sleep_backoff(attempt: int) -> None:
+def _ordered_embeddings(items: Any, batch: Sequence[str]) -> list[list[float]]:
+    """Put embeddings back into input order using the API's index field.
+
+    Three separate ways this used to misalign vectors against texts:
+    sorting on the raw value ordered string indices lexicographically
+    ("0","10","1","2"), a missing index defaulted to 0 and shifted every
+    following row, and duplicates resolved by arrival order.
+    """
+    if not isinstance(items, list):
+        raise RuntimeError(f"embedding API returned {type(items).__name__} instead of a list")
+
+    indexed: dict[int, list[float]] = {}
+    for position, item in enumerate(items):
+        if not isinstance(item, dict) or "embedding" not in item:
+            raise RuntimeError(f"embedding API returned a malformed item at position {position}")
+        raw_index = item.get("index", position)
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"embedding API returned a non-integer index {raw_index!r}") from exc
+        if not 0 <= index < len(batch):
+            raise RuntimeError(f"embedding API returned out-of-range index {index} for a batch of {len(batch)}")
+        if index in indexed:
+            raise RuntimeError(f"embedding API returned index {index} twice")
+        indexed[index] = item["embedding"]
+
+    missing = [i for i in range(len(batch)) if i not in indexed]
+    if missing:
+        raise RuntimeError(f"embedding API omitted indices {missing[:5]} of {len(batch)}")
+    return [indexed[i] for i in range(len(batch))]
+
+
+def _sleep_backoff(attempt: int, retry_after: str | None = None) -> None:
     import time
 
-    time.sleep(min(2**attempt * 0.25, 4.0))
+    delay = min(2**attempt * 0.25, 4.0)
+    if retry_after:
+        with contextlib.suppress(ValueError):
+            delay = max(delay, min(float(retry_after), 30.0))
+    time.sleep(delay)
 
 
 class OpenAIEmbedder(_HttpEmbedder):
@@ -179,6 +240,8 @@ class OpenAIEmbedder(_HttpEmbedder):
         return cast("np.ndarray[Any, Any]", self.embed_many([text])[0])
 
     def embed_many(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.dim), dtype=np.float32)
         rows: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = list(texts[start : start + self.batch_size])
@@ -187,10 +250,17 @@ class OpenAIEmbedder(_HttpEmbedder):
                 self._headers(),
                 {"model": self.model, "input": batch},
             )
-            # The API may return items out of order; honour its index field.
-            items = sorted(data["data"], key=lambda item: item.get("index", 0))
-            rows.extend(item["embedding"] for item in items)
-        return cast("np.ndarray[Any, Any]", np.asarray(rows, dtype=np.float32))
+            rows.extend(_ordered_embeddings(data.get("data"), batch))
+        matrix = np.asarray(rows, dtype=np.float32)
+        if matrix.shape[0] != len(texts):
+            # Without this the caller silently receives the wrong number of
+            # vectors and every later chunk carries its neighbour's embedding --
+            # the same class of silent misattribution as a desynced index, and
+            # far harder to notice because nothing raises.
+            raise RuntimeError(
+                f"embedding API returned {matrix.shape[0]} vectors for {len(texts)} inputs"
+            )
+        return cast("np.ndarray[Any, Any]", matrix)
 
     def _headers(self) -> dict[str, str]:
         key = self.api_key or os.environ.get("OPENAI_API_KEY")

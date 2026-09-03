@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,6 +133,13 @@ class Corpus:
         # deleted rows forces a full reload.
         self._loaded_append = -1
         self._loaded_structure = -1
+        # Guards the whole load path. Without it two threads calling search()
+        # concurrently both observed the same append_revision, both ran
+        # _extend_rows, and both appended -- leaving _rows twice as long as the
+        # vector matrix and attributing dense hits to the wrong chunks. Store is
+        # documented as thread-safe and the HTTP API runs sync endpoints on a
+        # thread pool, so this is the normal deployment, not an exotic one.
+        self._load_lock = threading.RLock()
         self._guard_embedder_mismatch()
 
     # -- construction -------------------------------------------------------
@@ -290,14 +298,29 @@ class Corpus:
         alignment between the BM25 index, the vector matrix and `_rows` would
         silently attribute results to the wrong chunks.
         """
-        structure = self.store.structure_revision
-        append = self.store.append_revision
-        if not self._loaded or structure != self._loaded_structure:
-            self._rebuild_rows()
-        elif append != self._loaded_append:
-            self._extend_rows()
-        self._loaded_append = append
-        self._loaded_structure = structure
+        with self._load_lock:
+            if self._loaded and self._up_to_date():
+                return
+            # Re-read under the lock: two threads can both arrive here having
+            # seen the same stale revision, and only one may extend.
+            structure, append = self.store.revisions()
+            if not self._loaded or structure != self._loaded_structure:
+                self._rebuild_rows()
+            elif append != self._loaded_append:
+                self._extend_rows()
+            self._loaded_append = append
+            self._loaded_structure = structure
+
+    def _up_to_date(self) -> bool:
+        """True when the in-memory indexes already reflect the store.
+
+        Both counters are read in ONE query. Reading them separately let a
+        delete-plus-append commit between the two reads, which sent the loader
+        down the incremental path on a row set that had shrunk -- one query then
+        served a deleted chunk and missed the new one.
+        """
+        structure, append = self.store.revisions()
+        return structure == self._loaded_structure and append == self._loaded_append
 
     def _rebuild_rows(self) -> None:
         """Load the whole corpus from SQLite into both in-memory indexes."""
@@ -361,9 +384,10 @@ class Corpus:
 
     def invalidate(self) -> None:
         """Force indexes to reload from SQLite on the next search."""
-        self._loaded = False
-        self._loaded_append = -1
-        self._loaded_structure = -1
+        with self._load_lock:
+            self._loaded = False
+            self._loaded_append = -1
+            self._loaded_structure = -1
 
     def configure(self, **overrides: Any) -> CorpusConfig:
         """Update retrieval parameters on a live corpus.
@@ -383,8 +407,7 @@ class Corpus:
             setattr(cfg, key, value)
         # BM25 parameters are baked into the built index, so force a rebuild of it.
         self._bm25 = BM25Index(cfg.bm25)
-        self._loaded = False
-        self._pending = False
+        self.invalidate()
         return cfg
 
     def rebuild(self) -> dict[str, Any]:

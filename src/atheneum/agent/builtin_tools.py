@@ -42,8 +42,18 @@ def build_corpus_tools(
         if not query.strip():
             return {"query": query, "results": [], "note": "empty query"}
         if mode not in modes:
-            raise ValueError(f"mode must be one of {list(modes)}, got {mode!r}")
-        bounded = max(1, min(int(top_k), max_top_k))
+            # Returning a dict keeps this an ordinary tool result; raising made the
+            # model see an exception string with no list of valid modes.
+            return {
+                "error": "invalid_arguments",
+                "message": f"mode must be one of {list(modes)}",
+                "got": mode,
+            }
+        try:
+            requested = int(top_k)
+        except (TypeError, ValueError):
+            return {"error": "invalid_arguments", "message": "top_k must be an integer", "got": str(top_k)}
+        bounded = max(1, min(requested, max_top_k))
         results = corpus.search(query, top_k=bounded, mode=mode)  # type: ignore[arg-type]
         return {
             "query": query,
@@ -70,13 +80,31 @@ def build_corpus_tools(
             "metadata": chunk.metadata,
         }
 
-    @tool(name="read_source", description="Read a whole document by source path, capped at a character limit.")
+    @tool(name="read_source", description="Read a whole document by exact source path.")
     def read_source(source: str, max_chars: int = 8000) -> dict[str, Any]:
+        if not source.strip():
+            return {"error": "invalid_arguments", "message": "source must not be empty"}
+        try:
+            int(max_chars)
+        except (TypeError, ValueError):
+            return {"error": "invalid_arguments", "message": "max_chars must be an integer", "got": str(max_chars)}
         document = corpus.store.find_document_by_source(source)
         if document is None:
-            matches = [row for row in corpus.sources(limit=1000) if source in row["source"]]
+            # Only an exact filename match, and only when it is unique. A bare
+            # substring test returned the wrong document -- read_source("b.py")
+            # served src/ab.py -- and an empty string matched everything because
+            # "" is a substring of every path.
+            name = source.rsplit("/", 1)[-1]
+            matches = [row for row in corpus.sources(limit=1000) if row["source"].rsplit("/", 1)[-1] == name]
             if not matches:
                 return {"error": "not_found", "source": source}
+            if len(matches) > 1:
+                return {
+                    "error": "ambiguous_source",
+                    "source": source,
+                    "candidates": [row["source"] for row in matches[:10]],
+                    "message": "several indexed documents share that filename; pass the full path",
+                }
             document = corpus.store.get_document(matches[0]["id"])
         if document is None:
             return {"error": "not_found", "source": source}

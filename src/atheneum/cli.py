@@ -544,9 +544,19 @@ def serve(ctx: click.Context, host: str, port: int, reload: bool) -> None:
             "the HTTP API needs the `api` extra: pip install atheneum[api]"
         ) from exc
     options = _opts(ctx)
-    os.environ.setdefault("ATHENEUM_DB", str(options["db"]))
-    click.echo(f"serving atheneum on http://{host}:{port} (db={options['db']})")
-    uvicorn.run("atheneum.api.http:app", host=host, port=port, reload=reload)
+    db = str(options["db"])
+    # The worker resolves config from the environment, so the database choice has
+    # to be published there rather than passed in-process; with reload or multiple
+    # workers the child process re-reads it from the environment anyway.
+    os.environ["ATHENEUM_DB"] = db
+    click.echo(f"serving atheneum on http://{host}:{port} (db={db})")
+    uvicorn.run(
+        "atheneum.api.http:build_app",
+        host=host,
+        port=port,
+        reload=reload,
+        factory=True,
+    )
 
 
 def main() -> int:
