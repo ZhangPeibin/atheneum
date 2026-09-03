@@ -226,7 +226,27 @@ class ToolRegistry:
         timed-out tool is *reported* as failed but its thread cannot be killed, so
         the work may still be running in the background.
         """
-        gated = self._tools.get(call.name)
+        definition = self._tools.get(call.name)
+        if definition is None:
+            available = ", ".join(self.names()) or "none"
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                content=json.dumps(
+                    {
+                        "error": "unknown_tool",
+                        "message": f"no tool named {call.name!r} is registered",
+                        "available": available,
+                    }
+                ),
+                is_error=True,
+            )
+
+        # Approval is checked before anything else, including argument coercion.
+        # Coercing first meant a call that was going to be refused anyway reported
+        # "invalid_arguments", so the model corrected arguments for an operation
+        # it was never allowed to perform.
+        gated = definition
         if gated is not None and gated.requires_approval:
             approved = approver is not None and self._approved(call, gated, approver)
             if not approved:
@@ -244,6 +264,7 @@ class ToolRegistry:
         if timeout is not None and timeout > 0:
             return self._execute_with_timeout(call, result_limit=result_limit, timeout=timeout)
         return self._execute(call, result_limit=result_limit)
+
     @staticmethod
     def _approved(call: ToolCall, definition: Tool, approver: Callable[[ToolCall, Tool], bool]) -> bool:
         try:

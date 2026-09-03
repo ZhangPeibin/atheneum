@@ -1561,3 +1561,58 @@ def test_approval_is_enforced_by_the_registry_not_only_the_loop():
     assert registry.execute(
         ToolCall(id="c", name="wipe", arguments={}), approver=lambda _c, _t: True
     ).content == "wiped"
+
+
+# ---------------------------------------------------------------------------
+# Round 10 — embedding payload validation and approval ordering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rows,texts,dim",
+    [
+        ([[1.0, 2.0], [3.0, 4.0]], ["a", "b"], 0),      # zero width
+        ([[1.0, 2.0, 3.0]], ["a"], 2),                  # too wide
+        ([[1.0, 2.0]], ["a", "b", "c"], 2),             # too few
+    ],
+)
+def test_validate_matrix_rejects_unusable_shapes(rows, texts, dim):
+    """A zero-width matrix passes every other check and then matches nothing."""
+    with pytest.raises(RuntimeError):
+        _validate_matrix(rows, texts, dim)
+
+
+@pytest.mark.parametrize("row", [[1.0, 2.0], (1.0, 2.0), np.array([1.0, 2.0], dtype=np.float32)])
+def test_validate_matrix_accepts_any_sequence_row(row):
+    """Accepting a tuple but rejecting a numpy row made the guard deserialization-dependent."""
+    matrix = _validate_matrix([row, [3.0, 4.0]], ["a", "b"], 2)
+    assert matrix.shape == (2, 2)
+    assert np.isfinite(matrix).all()
+
+
+@pytest.mark.parametrize("item", [{"index": 0, "embedding": None}, {"index": 0}, {"index": 0, "embedding": "x"}])
+def test_a_missing_or_null_embedding_is_a_clean_error(item):
+    """`embedding: None` used to raise a bare TypeError from a subscript."""
+    with pytest.raises(RuntimeError, match="malformed item"):
+        _ordered_embeddings([item], ["a"])
+
+
+def test_approval_is_decided_before_arguments_are_processed():
+    """A refused call must not report invalid_arguments.
+
+    Coercing first told the model to fix arguments for an operation it was never
+    allowed to perform.
+    """
+    def destruct(unused: int = 0) -> str:
+        """Destructive."""
+        return "ran"
+
+    registry = ToolRegistry([tool(destruct, name="destruct", requires_approval=True)])
+    bad = ToolCall(id="c", name="destruct", arguments={"bogus": 1})
+
+    assert json.loads(registry.execute(bad).content)["error"] == "not_approved"
+    assert json.loads(registry.execute(bad, approver=lambda _c, _d: False).content)["error"] == "not_approved"
+    # Once approved, normal validation applies.
+    assert json.loads(registry.execute(bad, approver=lambda _c, _d: True).content)["error"] == "invalid_arguments"
+    good = ToolCall(id="c", name="destruct", arguments={})
+    assert registry.execute(good, approver=lambda _c, _d: True).content == "ran"

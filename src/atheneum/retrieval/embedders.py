@@ -185,12 +185,25 @@ def _validate_matrix(rows: Any, texts: Sequence[str], dim: int) -> np.ndarray:
     """
     if not isinstance(rows, list):
         raise RuntimeError(f"embedding API returned {type(rows).__name__} instead of a list")
+    if dim <= 0:
+        # A zero-width matrix passes every other check and then silently matches
+        # nothing, so the corpus would index and never retrieve.
+        raise RuntimeError(f"embedding dimension must be positive, got {dim}")
     if len(rows) != len(texts):
         raise RuntimeError(f"embedding API returned {len(rows)} vectors for {len(texts)} inputs")
     matrix = np.empty((len(rows), dim), dtype=np.float32)
     for position, row in enumerate(rows):
-        if not isinstance(row, list) or len(row) != dim:
-            width = len(row) if isinstance(row, list) else "not-a-list"
+        # Any sequence, not just list: a tuple or a numpy row is a legitimate
+        # embedding, and accepting one while rejecting the other made the guard
+        # depend on how the caller happened to deserialize.
+        width: object
+        if isinstance(row, list | tuple | np.ndarray):
+            width = len(row)
+        elif row is None:
+            width = "null"
+        else:
+            width = f"not-a-sequence ({type(row).__name__})"
+        if width != dim:
             raise RuntimeError(
                 f"embedding API returned a vector of width {width} for position {position}, expected {dim}"
             )
@@ -217,8 +230,14 @@ def _ordered_embeddings(items: Any, batch: Sequence[str]) -> list[list[float]]:
 
     indexed: dict[int, list[float]] = {}
     for position, item in enumerate(items):
-        if not isinstance(item, dict) or "embedding" not in item:
-            raise RuntimeError(f"embedding API returned a malformed item at position {position}")
+        if not isinstance(item, dict) or not isinstance(item.get("embedding"), list | tuple | np.ndarray):
+            # `item["embedding"] is None` passed the old membership check and then
+            # raised a bare TypeError from the subscript, which is not a
+            # ProviderError-shaped failure and gave the caller nothing to act on.
+            raise RuntimeError(
+                f"embedding API returned a malformed item at position {position}: "
+                f"embedding is {type(item.get('embedding')).__name__ if isinstance(item, dict) else 'missing'}"
+            )
         raw_index = item.get("index", position)
         if isinstance(raw_index, bool) or not isinstance(raw_index, int | str):
             # int(1.9) would silently truncate a float index onto the wrong row.
