@@ -218,11 +218,27 @@ removes the FTS5 dependency. The trade-off is documented in the README.
   returns an `AgentRun` with `stopped_reason="max_turns"` rather than raising, so a
   caller always gets whatever was produced. The failure is reported in the result,
   not thrown through it.
-- Tool errors are data. `ToolRegistry.execute` catches every exception and returns
+- `max_turns` bounds *iterations*, not duration, so `AgentConfig.tool_timeout`
+  exists for tools that block. It runs the call in a worker thread and shuts the
+  executor down with `wait=False`: a timed-out tool is reported as failed and the
+  agent proceeds, but its thread cannot be killed and the work may still be
+  running. That asymmetry is stated rather than hidden.
+- Tool errors are data. `ToolRegistry.execute` catches `BaseException` and returns
   a `ToolResult(is_error=True)` whose content names the error type and tells the
-  model what to do next. The run continues.
+  model what to do next. The run continues. `KeyboardInterrupt`, `SystemExit`,
+  `CancelledError` and `GeneratorExit` are re-raised: those are process and task
+  signals, and turning cancellation into data defeats it. Serialisation is inside
+  the same guard, and never uses `repr()` — a raising `__repr__`, or a deeply
+  nested value whose repr blows the stack, used to escape as a crash.
 - **One loop body, two views.** `Agent.run` and `Agent.stream` share the same
-  termination, tool-execution and memory logic rather than duplicating it.
+  termination, tool-execution and memory logic rather than duplicating it. They are
+  asserted field-by-field equal — `answer`, `stopped_reason`, `turns`, `usage` and
+  per-step usage — because the first version of this claim was false: streaming
+  stamped cumulative usage into every step and lacked the `no_tools` guard.
+- `requires_approval` is enforced by the registry, not only by the loop. It was a
+  property of the tool that exactly one caller honoured, so `execute()` directly
+  ran a declared-destructive tool with no prompt. A missing or raising approver
+  declines.
 - Durable checkpointing, graph orchestration and cancellation semantics are
   deliberately **not** built. `langgraph`'s issue backlog shows how much complexity
   they carry, and none of it is needed for a local research assistant.
@@ -302,7 +318,22 @@ Groq, Mistral, Together, OpenRouter, Moonshot, DashScope, Ollama, LM Studio and
 vLLM, parameterised by base URL and model. Per-vendor quirks are recorded in
 `PROVIDER_PROFILES[*].capabilities` rather than discovered at runtime. Anthropic
 gets its own provider because the wire format genuinely differs. Keys come from the
-environment and are never written to disk.
+environment, are excluded from `repr`, and are never written to disk.
+
+Two rules came out of review rather than from the literature:
+
+- **Never trust a provider's payload shape.** `_validate_matrix` checks count,
+  per-row width and finiteness for *both* HTTP embedders, and `_ordered_embeddings`
+  rejects non-integer, out-of-range, duplicated and omitted indices. Every one of
+  those failures is a silent misattribution if it passes: one vector short and
+  every later chunk carries its neighbour's embedding. The OpenAI path got this
+  guard first and its Ollama sibling was left without it, which is the argument for
+  one shared validator.
+- **Reject locally what the API would reject remotely.** Anthropic's `_build_messages`
+  merges consecutive tool results into a single user message, because the API
+  requires alternating roles; `_validate_pairing` then refuses an unanswered
+  `tool_use`, an orphan `tool_result` or a blank id. All three serialized cleanly
+  and failed only as an HTTP 400 with no clue what was wrong.
 
 ### HTTP API
 
@@ -376,12 +407,12 @@ src/atheneum/
 ├── index/bm25.py          Okapi BM25 over an inverted index
 ├── index/selection.py     deterministic top-k shared by both retrievers (ties -> lowest index)
 ├── index/vectors.py       packed float32 matrix, normalized rows, one matmul per query
-├── index/store.py         SQLite schema + migrations, WAL, lock-guarded, revision counters
+├── index/store.py         SQLite schema + migrations, WAL, lock-guarded, nestable transactions, revision counters
 ├── ingest.py              file discovery, encoding detection, binary rejection
 ├── retrieval/embedders.py hashing (default, offline) + OpenAI/Ollama/ST backends
 ├── retrieval/fusion.py    RRF (k=61), DBSF, weighted sum
 ├── retrieval/rerank.py    coverage re-scorer (free) + cross-encoder (opt-in)
-├── retrieval/pipeline.py  Corpus: the only class most callers need
+├── retrieval/pipeline.py  Corpus: publishes an immutable (rows, bm25, vectors) snapshot
 ├── providers/base.py      Provider protocol, GenerationRequest, Generation, Usage
 ├── providers/offline.py   deterministic extractive engine — the shipped default
 ├── providers/openai_compat.py  12 vendors through one implementation
@@ -397,13 +428,34 @@ src/atheneum/
 └── cli.py                 ath index|search|ask|chat|serve|eval|bench|...
 ```
 
+**In-memory indexes are published, not mutated.** `Corpus` holds one immutable
+snapshot — `(rows, bm25, vectors)` — replaced by a single atomic assignment at the
+end of each reload. Readers take it once per query and use it throughout, so a
+reload can never pair a new row list with an old vector matrix. Every reload
+builds *fresh* structures and rebinds, which is what makes an older snapshot safe
+to keep using.
+
+This replaced an incremental `_extend_rows` path. Appending into a live index was
+faster on paper and wrong in practice: two threads could both observe the same
+`append_revision` and both extend, and `configure()` could swap the BM25 index out
+from under an in-flight reload, leaving a corpus that reported itself fresh while
+its index held zero documents. Rebuilding re-reads *stored term frequencies*
+rather than re-tokenizing, so the cost is a table scan, not a re-index — a trade
+worth making for an invariant that is easy to state and hard to violate.
+
 `index/store.py` keeps two revision counters, `append_revision` and
-`structure_revision`, so an in-memory index can distinguish "rows were appended"
-(fold in cheaply) from "rows were deleted" (the positional alignment between the
-BM25 index, the vector matrix and the chunk list is gone; reload everything).
-One counter would have forced a full reload after every write; none at all let a
-second process's delete go unnoticed, which made search attribute results to the
-wrong chunks.
+`structure_revision`, read together as one snapshot. Two counters let a reload
+distinguish "rows were appended" from "rows were deleted"; reading them in two
+queries let a delete-plus-append commit between them and sent the loader down the
+wrong path, serving a deleted chunk and missing the new one.
+
+`Store.transaction()` is nestable by depth, so public mutators — which each open
+their own transaction — can be composed inside a caller's atomic block. Before
+that, `with store.transaction(): store.set_meta(...)` raised "cannot start a
+transaction within a transaction", which made atomic multi-step writes impossible
+to express at all. `Corpus.invalidate()` takes no lock: acquiring the refresh lock
+there inverted the lock order against `Store.transaction()`, which holds its lock
+across the `yield`, and the pair deadlocked.
 
 Hard dependencies are **click** and **numpy**. `httpx`, `fastapi` and `uvicorn` are
 extras. Nothing else is imported at startup — `sentence_transformers` and `torch`
